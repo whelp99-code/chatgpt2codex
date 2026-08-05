@@ -789,10 +789,24 @@ async function cmdDoctor(): Promise<void> {
   const ownerTokenReady = await hasOwnerToken(stateDir);
   const intake = await checkIntakeAvailability();
 
+  // Show the configured roots and what they resolve to. Without this the
+  // only way to tell whether workspaces.txt was picked up is to start the
+  // server and read its log.
+  const configuredRoots = resolveWorkspaceRoots({ flags: {}, repeated: {} });
+  const { entries: doctorRegistry, failedRoots } = await scanWorkspaces(configuredRoots);
+
   console.log(`node: ${nodeVersion}`);
   console.log(`ripgrep: ${rgVersion ?? "not found"}`);
   console.log(`git: ${gitVersion ?? "not found"}`);
-  console.log(`workspace: ${workspacePath}`);
+  console.log(`workspace roots file: ${path.join(stateDir, WORKSPACES_FILE)}`);
+  console.log(`workspace roots (${configuredRoots.length}):`);
+  for (const root of configuredRoots) {
+    const count = doctorRegistry.filter((e) => e.workspaceRoot === root).length;
+    const failure = failedRoots.find((f) => f.root === root);
+    console.log(`  - ${root}${failure ? "  [UNREADABLE]" : `  (${count} project(s))`}`);
+  }
+  console.log(`projects indexed: ${doctorRegistry.length}`);
+  console.log(`cwd: ${workspacePath}`);
   console.log(`state dir: ${stateDir}`);
   console.log(`registered tools: ${toolCount}`);
   console.log(
