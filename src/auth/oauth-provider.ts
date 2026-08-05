@@ -805,7 +805,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     // because the token is the actual local-owner approval gate.
     const csrfToken = String(res.req.body?.csrf_token ?? "");
     const csrfAccepted = this.consumeCsrfToken(csrfToken);
-    const providedToken = String(res.req.body?.owner_token ?? "");
+    // Trim before comparing. The token is copied to the clipboard and pasted
+    // into this form by hand, and a stray leading/trailing space or newline
+    // picked up along the way would otherwise read as a wrong token — an
+    // indistinguishable failure from actually having the wrong token. The
+    // CLI already trims on the way in (owner-token --set-stdin), so trimming
+    // here keeps both ends of the comparison consistent.
+    const providedToken = String(res.req.body?.owner_token ?? "").trim();
     if (!csrfAccepted && !providedToken) {
       res.status(403).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(

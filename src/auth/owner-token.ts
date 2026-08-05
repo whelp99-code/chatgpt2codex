@@ -50,7 +50,8 @@ async function ensureDir(stateDir: string): Promise<void> {
  * Returns nothing containing the plaintext token — callers must print it
  * themselves, exactly once, at generation time.
  */
-export async function storeOwnerToken(stateDir: string, token: string): Promise<void> {
+export async function storeOwnerToken(stateDir: string, rawToken: string): Promise<void> {
+  const token = rawToken.trim();
   if (token.length < MIN_OWNER_TOKEN_LENGTH) {
     throw new Error(`Owner token must be at least ${MIN_OWNER_TOKEN_LENGTH} characters`);
   }
