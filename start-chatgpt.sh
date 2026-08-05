@@ -31,9 +31,26 @@ if [[ ! -f "$DOCTOR_SCRIPT" && -f "$ROOT/scripts/macos-dependency-doctor.sh" ]];
   DOCTOR_SCRIPT="$ROOT/scripts/macos-dependency-doctor.sh"
 fi
 
+# Where preserved failure logs go. The temp logs used to be deleted by the
+# EXIT trap immediately after the failure message printed their paths, so the
+# one thing needed to diagnose a failed start was always already gone.
+DIAG_DIR="${CHATGPT2CODEX_DIAG_DIR:-$HOME/Library/Logs/ChatGPT To Codex}"
+
+preserve_logs() {
+  mkdir -p "$DIAG_DIR" 2>/dev/null || return 0
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  [[ -s "$CFLOG" ]] && cp "$CFLOG" "$DIAG_DIR/cloudflared-$stamp.log" 2>/dev/null || true
+  [[ -s "$SRVLOG" ]] && cp "$SRVLOG" "$DIAG_DIR/server-$stamp.log" 2>/dev/null || true
+  echo "[chatgpt2codex] failure logs kept in: $DIAG_DIR" >&2
+}
+
 cleanup() {
+  local status=$?
   echo
   echo "[chatgpt2codex] stopping server/tunnel..."
+  # Keep the evidence when we are going down because something failed.
+  [[ "$status" -ne 0 ]] && preserve_logs
   [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
   [[ -n "${CF_PID:-}" ]] && kill "$CF_PID" 2>/dev/null || true
   rm -f "$CFLOG" "$SRVLOG"
@@ -69,7 +86,10 @@ wait_http_ok() {
   local label="$3"
   local i
   for i in $(seq 1 "$tries"); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+    # --max-time matters: without it a hung connection can stall each attempt
+    # indefinitely, so "20 tries" turns into an unbounded wait with the app
+    # stuck on a progress line and no way to tell what is happening.
+    if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
       return 0
     fi
     sleep_1s
@@ -118,7 +138,7 @@ wait_public_http_ok() {
   local label="$3"
   local i
   for i in $(seq 1 "$tries"); do
-    if curl -fsS "$url" >/dev/null 2>&1 || http_ok_with_curl_resolve "$url"; then
+    if curl -fsS --max-time 10 "$url" >/dev/null 2>&1 || http_ok_with_curl_resolve "$url"; then
       return 0
     fi
     sleep_1s
@@ -274,6 +294,28 @@ if [[ "$USE_TUNNEL" == "1" ]]; then
     CLOUDFLARED_TUNNEL_NAME=""
   fi
 
+  # `cloudflared tunnel --hostname <host> --url <origin>` does NOT publish a
+  # custom hostname on current cloudflared. The flag is accepted and then
+  # silently ignored: cloudflared requests a random *.trycloudflare.com quick
+  # tunnel instead, logs "Requesting new quick Tunnel", and connects fine.
+  # Everything looks healthy while the custom hostname serves nothing — so the
+  # health check below waited on an address that could never come up, and then
+  # tore down a perfectly working server. Publishing a custom hostname needs a
+  # NAMED tunnel (a dashboard token, or a tunnel name plus credentials and a
+  # DNS route). Without one, say so plainly and use the quick tunnel we can
+  # actually get, so the app still ends up usable.
+  if [[ -n "$PUBLIC_HOSTNAME" && -z "${CLOUDFLARED_TUNNEL_TOKEN:-}" && -z "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
+    echo "[chatgpt2codex] warning: '$PUBLIC_HOSTNAME' cannot be published without a named Cloudflare tunnel." >&2
+    echo "[chatgpt2codex] warning: cloudflared ignores --hostname unless a tunnel token/name is configured." >&2
+    echo "[chatgpt2codex] warning: using a temporary quick tunnel for this run instead." >&2
+    echo "[chatgpt2codex] warning: for a stable '$PUBLIC_HOSTNAME', set a tunnel token in Settings, or run:" >&2
+    echo "[chatgpt2codex] warning:   cloudflared tunnel login" >&2
+    echo "[chatgpt2codex] warning:   cloudflared tunnel create chatgpt2codex" >&2
+    echo "[chatgpt2codex] warning:   cloudflared tunnel route dns chatgpt2codex $PUBLIC_HOSTNAME" >&2
+    echo "[chatgpt2codex] warning: then put the tunnel name in Settings." >&2
+    PUBLIC_HOSTNAME=""
+  fi
+
   if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
     PUBLIC_URL="https://${PUBLIC_HOSTNAME}"
     if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
@@ -281,10 +323,6 @@ if [[ "$USE_TUNNEL" == "1" ]]; then
     else
       cloudflared tunnel --no-autoupdate run --url "http://127.0.0.1:$PORT" "$CLOUDFLARED_TUNNEL_NAME" >"$CFLOG" 2>&1 &
     fi
-    CF_PID=$!
-  elif [[ -n "$PUBLIC_HOSTNAME" ]]; then
-    PUBLIC_URL="https://${PUBLIC_HOSTNAME}"
-    cloudflared tunnel --hostname "$PUBLIC_HOSTNAME" --url "http://127.0.0.1:$PORT" --no-autoupdate >"$CFLOG" 2>&1 &
     CF_PID=$!
   else
     if ! start_quick_tunnel_with_retry 4; then
@@ -332,8 +370,26 @@ fi
 if [[ "$USE_TUNNEL" == "1" ]]; then
   echo "[chatgpt2codex] 3/3 checking public health..."
   if ! wait_public_http_ok "$PUBLIC_URL/healthz" 60 "public endpoint"; then
-    echo "[chatgpt2codex] cloudflared log: $CFLOG" >&2
-    echo "[chatgpt2codex] server log: $SRVLOG" >&2
+    echo "[chatgpt2codex] ---------------------------------------------------" >&2
+    echo "[chatgpt2codex] The LOCAL server started fine; the PUBLIC address is" >&2
+    echo "[chatgpt2codex] not reachable, so ChatGPT web cannot connect yet." >&2
+    echo "[chatgpt2codex] Local endpoint that IS working: http://127.0.0.1:$PORT/mcp" >&2
+    echo "[chatgpt2codex] Failing public endpoint:        $PUBLIC_URL/healthz" >&2
+    echo "[chatgpt2codex] --- cloudflared output ------------------------------" >&2
+    # Print the tunnel's own error inline. Pointing at a temp file the EXIT
+    # trap is about to delete is what made this failure undiagnosable.
+    if [[ -s "$CFLOG" ]]; then
+      tail -n 60 "$CFLOG" >&2
+    else
+      echo "[chatgpt2codex] (cloudflared produced no output at all)" >&2
+    fi
+    echo "[chatgpt2codex] ----------------------------------------------------" >&2
+    if [[ -n "$PUBLIC_HOSTNAME" ]]; then
+      echo "[chatgpt2codex] The named tunnel connected but '$PUBLIC_HOSTNAME' is not serving." >&2
+      echo "[chatgpt2codex] Check that the tunnel has a DNS route to this hostname:" >&2
+      echo "[chatgpt2codex]   cloudflared tunnel route dns <tunnel-name> $PUBLIC_HOSTNAME" >&2
+      echo "[chatgpt2codex] and that the tunnel's ingress points at http://127.0.0.1:$PORT" >&2
+    fi
     exit 1
   fi
 fi
