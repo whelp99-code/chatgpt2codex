@@ -161,6 +161,76 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
   return entries;
 }
 
+/**
+ * Scan several workspace roots and merge them into one registry.
+ *
+ * Roots are independent folders the owner registered (e.g. ~/Playground and
+ * ~/work/clients), so three things have to be reconciled:
+ *
+ *  - **Duplicates.** Two roots can resolve to the same directory, or one root
+ *    can be a child of another, so the same project shows up twice. Entries
+ *    are de-duplicated by resolved path, first root wins.
+ *  - **Id collisions.** `~/a/api` and `~/b/api` both slugify to `api`, and a
+ *    colliding id would make project_select ambiguous or silently wrong. The
+ *    later one is suffixed with its parent directory name, and a numeric
+ *    suffix after that, so every id stays unique and still readable.
+ *  - **A missing root.** A folder that was renamed, unmounted, or deleted
+ *    must not take down every other project with it, so an unreadable root is
+ *    reported and skipped instead of throwing.
+ *
+ * Returns the merged entries plus whichever roots could not be read, so the
+ * caller can surface that without failing startup.
+ */
+export async function scanWorkspaces(
+  roots: string[],
+): Promise<{ entries: ProjectRegistryEntry[]; failedRoots: Array<{ root: string; reason: string }> }> {
+  const entries: ProjectRegistryEntry[] = [];
+  const failedRoots: Array<{ root: string; reason: string }> = [];
+  const seenRootPaths = new Set<string>();
+  const usedIds = new Set<string>();
+  const seenScanRoots = new Set<string>();
+
+  for (const rawRoot of roots) {
+    const root = path.resolve(rawRoot);
+    if (seenScanRoots.has(root)) continue;
+    seenScanRoots.add(root);
+
+    let scanned: ProjectRegistryEntry[];
+    try {
+      scanned = await scanWorkspace(root);
+    } catch (err) {
+      failedRoots.push({ root, reason: err instanceof Error ? err.message : String(err) });
+      continue;
+    }
+
+    for (const entry of scanned) {
+      const resolvedRoot = path.resolve(entry.root);
+      if (seenRootPaths.has(resolvedRoot)) continue;
+      seenRootPaths.add(resolvedRoot);
+
+      let projectId = entry.projectId;
+      if (usedIds.has(projectId)) {
+        const parent = slugify(path.basename(path.dirname(resolvedRoot)));
+        const qualified = parent.length > 0 ? `${parent}-${projectId}` : projectId;
+        projectId = qualified;
+        let suffix = 2;
+        while (usedIds.has(projectId)) {
+          projectId = `${qualified}-${suffix}`;
+          suffix += 1;
+        }
+      }
+      usedIds.add(projectId);
+
+      // Keep the original id reachable as an alias so a name that used to
+      // resolve still does, as long as it stays unambiguous.
+      const aliases = Array.from(new Set([...entry.aliases, entry.projectId]));
+      entries.push({ ...entry, projectId, aliases, workspaceRoot: root });
+    }
+  }
+
+  return { entries, failedRoots };
+}
+
 /** Levenshtein edit distance between two strings. */
 function editDistance(a: string, b: string): number {
   const m = a.length;

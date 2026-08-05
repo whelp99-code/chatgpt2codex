@@ -28,6 +28,10 @@ const ProjectRegistryEntrySchema = z.object({
   hasCodeBrain: z.boolean().optional(),
   packageHints: z.array(z.string()).optional(),
   lastSeenAt: z.string().optional(),
+  // Which registered root this project was discovered under. Zod strips keys
+  // the schema does not mention, so omitting this silently dropped it on save
+  // and lost the only thing distinguishing two same-named projects.
+  workspaceRoot: z.string().optional(),
 }) satisfies z.ZodType<ProjectRegistryEntry>;
 
 const ProjectsFileSchema = z.object({

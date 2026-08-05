@@ -15,7 +15,21 @@ import {
   type ToolContext,
   type ToolResult,
 } from "../types.js";
-import { scanWorkspace, findProject } from "../workspace/registry.js";
+import { scanWorkspaces, findProject } from "../workspace/registry.js";
+
+/**
+ * The workspace roots for this context.
+ *
+ * `workspaceRoots` is the real field, but a ToolContext can be built by hand
+ * (tests, embedders) against the older single-root shape. Falling back to the
+ * primary root keeps those callers working instead of handing `undefined` to
+ * a scan.
+ */
+function workspaceRootsOf(ctx: ToolContext): string[] {
+  const roots = ctx.workspaceRoots;
+  if (Array.isArray(roots) && roots.length > 0) return roots;
+  return ctx.workspaceRoot ? [ctx.workspaceRoot] : [];
+}
 import { makeLease } from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
 import { codeSearch } from "../code/search.js";
@@ -877,7 +891,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "Automatic visible-image capture is intentionally not part of this build.",
             ],
             capabilities: {
-              workspaceRoot: ctx.workspaceRoot,
+              workspaceRoots: workspaceRootsOf(ctx),
               fileEdits: "project-confined patch/create with secret-path blocking",
               shell: "project-confined local shell with redacted output and secret/OS-destructive guards",
               e2e:
@@ -1222,11 +1236,19 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               path: input.path,
             });
           }
-          const realWorkspace = await fs.realpath(ctx.workspaceRoot).catch(() => ctx.workspaceRoot);
-          const rel = path.relative(realWorkspace, realPath);
-          if (rel.startsWith("..") || path.isAbsolute(rel)) {
-            throw new DomainError(ErrorCode.PATH_OUTSIDE_WORKSPACE, "path is outside workspace root", {
+          // The path has to sit under one of the registered roots — any of
+          // them, since several folders can be configured independently.
+          const realRoots = await Promise.all(
+            workspaceRootsOf(ctx).map((root) => fs.realpath(root).catch(() => root)),
+          );
+          const insideSomeRoot = realRoots.some((realRoot) => {
+            const rel = path.relative(realRoot, realPath);
+            return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+          });
+          if (!insideSomeRoot) {
+            throw new DomainError(ErrorCode.PATH_OUTSIDE_WORKSPACE, "path is outside every workspace root", {
               path: input.path,
+              workspaceRoots: workspaceRootsOf(ctx),
             });
           }
           const found = entries.find((e) => path.resolve(e.root) === path.resolve(realPath));
@@ -1265,14 +1287,20 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
     async (input) => {
       return withErrorMapping(ctx, "workspace_refresh_index", input, async () => {
-        const scanned = await scanWorkspace(ctx.workspaceRoot);
+        const roots = workspaceRootsOf(ctx);
+        const { entries: scanned, failedRoots } = await scanWorkspaces(roots);
         ctx.registry.splice(0, ctx.registry.length, ...scanned);
         await ctx.store.saveProjects(scanned);
         const updatedAt = Date.now();
-        return makeResult(
-          { count: scanned.length, updatedAt },
-          `Refreshed workspace index: ${scanned.length} project(s).`,
-        );
+        // Name unreadable roots rather than silently indexing fewer projects
+        // than the owner configured.
+        const rootCount = roots.length;
+        const summary =
+          failedRoots.length > 0
+            ? `Refreshed workspace index: ${scanned.length} project(s) across ${rootCount} root(s). ` +
+              `Could not read: ${failedRoots.map((f) => f.root).join(", ")}`
+            : `Refreshed workspace index: ${scanned.length} project(s) across ${rootCount} root(s).`;
+        return makeResult({ count: scanned.length, updatedAt, roots, failedRoots }, summary);
       });
     },
   );

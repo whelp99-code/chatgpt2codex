@@ -397,7 +397,42 @@ if [[ -n "${CHATGPT2CODEX_ACTIVE_PROJECT_ROOT:-}" ]]; then
   ACTIVE_PROJECT_ARGS+=(--active-project-root "$CHATGPT2CODEX_ACTIVE_PROJECT_ROOT")
   ACTIVE_PROJECT_ARGS+=(--active-project-preset "${CHATGPT2CODEX_ACTIVE_PROJECT_PRESET:-full-write}")
 fi
-SERVER_ARGS=(serve --http --port "$PORT" --public-url "$PUBLIC_URL" --workspace "$WORKSPACE")
+# Several workspace roots can be registered. They arrive newline-separated in
+# CHATGPT2CODEX_WORKSPACES (a delimiter that cannot appear in a POSIX path,
+# unlike the ':' or ',' a path could legitimately contain) and are forwarded as
+# repeated --workspace flags. WORKSPACE remains the single-root fallback so an
+# older configuration keeps working unchanged.
+WORKSPACES_FILE="${CHATGPT2CODEX_WORKSPACES_FILE:-$HOME/.local/share/chatgpt2codex/workspaces.txt}"
+WORKSPACE_ARGS=()
+
+add_workspace_root() {
+  local root="${1#"${1%%[![:space:]]*}"}"   # trim leading space
+  root="${root%"${root##*[![:space:]]}"}"   # trim trailing space
+  [[ -z "$root" || "$root" == \#* ]] && return 0
+  [[ "$root" == "~/"* ]] && root="$HOME/${root:2}"
+  mkdir -p "$root" 2>/dev/null || true
+  WORKSPACE_ARGS+=(--workspace "$root")
+}
+
+if [[ -n "${CHATGPT2CODEX_WORKSPACES:-}" ]]; then
+  while IFS= read -r workspace_root; do
+    add_workspace_root "$workspace_root"
+  done <<< "$CHATGPT2CODEX_WORKSPACES"
+elif [[ -f "$WORKSPACES_FILE" ]]; then
+  while IFS= read -r workspace_root || [[ -n "$workspace_root" ]]; do
+    add_workspace_root "$workspace_root"
+  done < "$WORKSPACES_FILE"
+fi
+
+if [[ "${#WORKSPACE_ARGS[@]}" -eq 0 ]]; then
+  WORKSPACE_ARGS=(--workspace "$WORKSPACE")
+fi
+echo "[chatgpt2codex] workspace roots ($(( ${#WORKSPACE_ARGS[@]} / 2 ))):"
+for ((i = 1; i < ${#WORKSPACE_ARGS[@]}; i += 2)); do
+  echo "[chatgpt2codex]   - ${WORKSPACE_ARGS[$i]}"
+done
+
+SERVER_ARGS=(serve --http --port "$PORT" --public-url "$PUBLIC_URL" "${WORKSPACE_ARGS[@]}")
 if [[ -n "$IDLE_SHUTDOWN_MINUTES" ]]; then
   SERVER_ARGS+=(--idle-shutdown-minutes "$IDLE_SHUTDOWN_MINUTES")
 fi

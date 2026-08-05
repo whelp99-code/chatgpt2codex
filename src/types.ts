@@ -26,6 +26,10 @@ export interface Project {
   hasCodeBrain?: boolean;
   packageHints?: string[];
   lastSeenAt?: string;
+  /** Which registered workspace root this project was discovered under. Set
+   * once several roots can be configured, so two same-named projects from
+   * different folders can be told apart. */
+  workspaceRoot?: string;
 }
 
 /**
@@ -63,7 +67,13 @@ export type ExecutionMode = "observe" | "read" | "edit" | "verify" | "danger";
 // ---------------------------------------------------------------------------
 
 export interface Config {
+  /** Primary workspace root — always `workspaceRoots[0]`. Kept as its own
+   * field so existing messages and callers that only need one root do not
+   * have to reach into the array. */
   workspaceRoot: string;
+  /** Every folder the owner registered as a workspace root. Projects are
+   * discovered under all of them and merged into one registry. */
+  workspaceRoots: string[];
   stateDir: string;
   /** Max bytes returned/read for a single file_read_slice call. */
   maxReadBytes: number;
@@ -82,7 +92,10 @@ export interface Config {
 // ---------------------------------------------------------------------------
 
 export interface ToolContext {
+  /** Primary workspace root — always `workspaceRoots[0]`. */
   workspaceRoot: string;
+  /** Every registered workspace root, in the order the owner listed them. */
+  workspaceRoots: string[];
   stateDir: string;
   /** Loaded/loadable project registry entries. */
   registry: ProjectRegistryEntry[];

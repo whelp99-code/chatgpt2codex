@@ -11,7 +11,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import type { Server as HttpListener } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +19,7 @@ import { promisify } from "node:util";
 import type { Express } from "express";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
-import { findProject, scanWorkspace } from "./workspace/registry.js";
+import { findProject, scanWorkspaces } from "./workspace/registry.js";
 import { makeLease } from "./workspace/project-select.js";
 import { Store } from "./state/store.js";
 import { Ledger } from "./state/ledger.js";
@@ -38,7 +38,12 @@ const execFileAsync = promisify(execFile);
 
 interface ParsedArgs {
   command: string | undefined;
+  /** Last value seen for each flag. Repeating a flag overwrites here. */
   flags: Record<string, string | boolean>;
+  /** Every value seen for each flag, in order. `--workspace` is repeatable
+   * so several workspace roots can be registered in one launch; `flags`
+   * alone would silently keep only the last one. */
+  repeated: Record<string, string[]>;
   /** Non-flag arguments after the command, e.g. `control approve <actionId>`. */
   positional: string[];
 }
@@ -46,6 +51,7 @@ interface ParsedArgs {
 function parseArgs(argv: string[]): ParsedArgs {
   const [command, ...rest] = argv;
   const flags: Record<string, string | boolean> = {};
+  const repeated: Record<string, string[]> = {};
   const positional: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -54,6 +60,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       const next = rest[i + 1];
       if (next !== undefined && !next.startsWith("--")) {
         flags[key] = next;
+        (repeated[key] ??= []).push(next);
         i++;
       } else {
         flags[key] = true;
@@ -62,7 +69,53 @@ function parseArgs(argv: string[]): ParsedArgs {
       positional.push(arg);
     }
   }
-  return { command, flags, positional };
+  return { command, flags, repeated, positional };
+}
+
+/**
+ * Resolve the workspace roots to index, in priority order:
+ *   1. every `--workspace <path>` on the command line (repeatable)
+ *   2. `CHATGPT2CODEX_WORKSPACES`, one path per line
+ *   3. `<stateDir>/workspaces.txt`, one path per line
+ *   4. the current directory
+ *
+ * The file in step 3 is the configuration surface that does not require
+ * rebuilding the desktop app: edit it and restart the server.
+ *
+ * Blank entries and `#` comments are dropped, `~/` is expanded, paths are
+ * resolved, and duplicates are removed while preserving the order the owner
+ * listed them in — the first root is the primary one used in status messages.
+ */
+export const WORKSPACES_FILE = "workspaces.txt";
+
+function readWorkspacesFile(stateDir: string): string[] {
+  try {
+    // Sync on purpose: root resolution happens before any async work, and
+    // keeping it sync avoids threading a promise through every entry point.
+    return readFileSync(path.join(stateDir, WORKSPACES_FILE), "utf8").split("\n");
+  } catch {
+    return [];
+  }
+}
+
+function resolveWorkspaceRoots(args: Pick<ParsedArgs, "flags" | "repeated">): string[] {
+  const hasContent = (lines: string[]): boolean => lines.some((line) => line.trim().length > 0);
+  const fromFlags = args.repeated.workspace ?? [];
+  const fromEnv = (process.env.CHATGPT2CODEX_WORKSPACES ?? "").split("\n");
+  const candidates = fromFlags.length > 0 ? fromFlags : hasContent(fromEnv) ? fromEnv : readWorkspacesFile(defaultStateDir());
+
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
+    const expanded = trimmed.startsWith("~/") ? path.join(os.homedir(), trimmed.slice(2)) : trimmed;
+    const resolved = path.resolve(expanded);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    roots.push(resolved);
+  }
+  return roots.length > 0 ? roots : [path.resolve(process.cwd())];
 }
 
 /** Default state dir per PRD §10: `~/.local/share/chatgpt2codex/`. */
@@ -70,9 +123,10 @@ function defaultStateDir(): string {
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
 }
 
-function defaultConfig(workspaceRoot: string, stateDir: string): Config {
+function defaultConfig(workspaceRoots: string[], stateDir: string): Config {
   return {
-    workspaceRoot,
+    workspaceRoot: workspaceRoots[0] ?? process.cwd(),
+    workspaceRoots,
     stateDir,
     maxReadBytes: 10 * 1024 * 1024,
     maxPatchBytes: 10 * 1024 * 1024,
@@ -92,20 +146,27 @@ function defaultConfig(workspaceRoot: string, stateDir: string): Config {
  * would replace the user's real project registry with a scan of the app
  * bundle.
  */
-async function buildToolContext(workspace: string, persistRegistry = true): Promise<ToolContext> {
-  const workspaceRoot = path.resolve(workspace);
+async function buildToolContext(workspaceRoots: string[], persistRegistry = true): Promise<ToolContext> {
+  const roots = workspaceRoots.map((root) => path.resolve(root));
+  const workspaceRoot = roots[0] ?? path.resolve(process.cwd());
   const stateDir = defaultStateDir();
 
   const store = new Store(stateDir);
   const ledger = new Ledger(stateDir);
 
-  const registry = await scanWorkspace(workspaceRoot);
+  const { entries: registry, failedRoots } = await scanWorkspaces(roots);
+  // One missing folder must not take the whole workspace down with it — say
+  // which root failed and index the rest.
+  for (const failure of failedRoots) {
+    console.error(`chatgpt2codex: skipping unreadable workspace root ${failure.root} (${failure.reason})`);
+  }
   if (persistRegistry) await store.saveProjects(registry);
 
-  const config = defaultConfig(workspaceRoot, stateDir);
+  const config = defaultConfig(roots, stateDir);
 
   return {
     workspaceRoot,
+    workspaceRoots: roots,
     stateDir,
     registry,
     ledger: { append: (event) => ledger.append(event) },
@@ -165,16 +226,21 @@ async function applyStartupProjectSelection(ctx: ToolContext, flags: Record<stri
   });
 }
 
-async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<void> {
-  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const ctx = await buildToolContext(workspace);
+async function cmdServeStdio(args: ParsedArgs): Promise<void> {
+  const flags = args.flags;
+  const ctx = await buildToolContext(resolveWorkspaceRoots(args));
   await applyStartupProjectSelection(ctx, flags);
   if (isControlEnabled()) startExecutor(ctx);
   const server = await createServer(ctx);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot });
-  console.error(`chatgpt2codex serve: listening on stdio (workspace=${ctx.workspaceRoot})`);
+  await ctx.ledger.append({
+    type: "workspace.opened",
+    workspaceRoot: ctx.workspaceRoot,
+    workspaceRoots: ctx.workspaceRoots,
+  });
+  console.error(`chatgpt2codex serve: listening on stdio (workspaces=${ctx.workspaceRoots.join(", ")})`);
+  console.error(`chatgpt2codex serve: indexed ${ctx.registry.length} project(s)`);
 }
 
 /**
@@ -284,9 +350,9 @@ function explainListenFailure(failure: ListenFailure, port: number, host: string
   }
 }
 
-async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<void> {
-  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const ctx = await buildToolContext(workspace);
+async function cmdServeHttp(args: ParsedArgs): Promise<void> {
+  const flags = args.flags;
+  const ctx = await buildToolContext(resolveWorkspaceRoots(args));
 
   if (!(await hasOwnerToken(ctx.stateDir))) {
     console.error(
@@ -368,12 +434,18 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
 
   console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);
   console.error(`chatgpt2codex serve --http: public URL ${publicUrl}/mcp`);
-  console.error(`chatgpt2codex serve --http: workspace=${ctx.workspaceRoot}`);
+  console.error(`chatgpt2codex serve --http: workspaces=${ctx.workspaceRoots.join(", ")}`);
+  console.error(`chatgpt2codex serve --http: indexed ${ctx.registry.length} project(s)`);
   if (idleShutdownMs !== undefined) {
     console.error(`chatgpt2codex serve --http: idle shutdown after ${idleShutdownMinutes} minute(s) without sessions`);
   }
 
-  await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot, transport: "http" });
+  await ctx.ledger.append({
+    type: "workspace.opened",
+    workspaceRoot: ctx.workspaceRoot,
+    workspaceRoots: ctx.workspaceRoots,
+    transport: "http",
+  });
 
   process.once("SIGINT", () => shutdown(130));
   process.once("SIGTERM", () => shutdown(143));
@@ -384,29 +456,35 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   await new Promise<void>(() => {});
 }
 
-async function cmdServe(flags: Record<string, string | boolean>): Promise<void> {
-  if (flags.http) {
-    await cmdServeHttp(flags);
+async function cmdServe(args: ParsedArgs): Promise<void> {
+  if (args.flags.http) {
+    await cmdServeHttp(args);
     return;
   }
-  await cmdServeStdio(flags);
+  await cmdServeStdio(args);
 }
 
-async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
-  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const workspaceRoot = path.resolve(workspace);
+async function cmdInit(args: ParsedArgs): Promise<void> {
+  const flags = args.flags;
+  const workspaceRoots = resolveWorkspaceRoots(args);
   const stateDir = defaultStateDir();
 
   const store = new Store(stateDir);
   const ledger = new Ledger(stateDir);
 
-  const registry = await scanWorkspace(workspaceRoot);
+  const { entries: registry, failedRoots } = await scanWorkspaces(workspaceRoots);
+  for (const failure of failedRoots) {
+    console.error(`chatgpt2codex init: skipping unreadable workspace root ${failure.root} (${failure.reason})`);
+  }
   await store.saveProjects(registry);
   await store.setSession({ activeProjectId: null, mode: "observe", lease: null });
-  await ledger.append({ type: "workspace.opened", workspaceRoot });
+  for (const root of workspaceRoots) {
+    await ledger.append({ type: "workspace.opened", workspaceRoot: root });
+  }
 
   console.error(
-    `chatgpt2codex init: initialized state dir ${stateDir} with ${registry.length} project(s) from ${workspaceRoot}`,
+    `chatgpt2codex init: initialized state dir ${stateDir} with ${registry.length} project(s) from ` +
+      `${workspaceRoots.length} root(s): ${workspaceRoots.join(", ")}`,
   );
 
   // PRD §11 SR-04: owner secret lives only as a hash on disk; the plaintext
@@ -696,7 +774,7 @@ async function cmdDoctor(): Promise<void> {
     // Read-only: doctor runs from whatever directory invoked it (the macOS
     // launcher runs it from inside the app bundle), so it must never write
     // that scan over the user's real projects.json.
-    const ctx = await buildToolContext(workspacePath, false);
+    const ctx = await buildToolContext([workspacePath], false);
     const server = await createServer(ctx);
     const serverAny = server as unknown as {
       _registeredTools?: Record<string, unknown>;
@@ -732,13 +810,14 @@ async function cmdDoctor(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const { command, flags, positional } = parseArgs(process.argv.slice(2));
+  const args = parseArgs(process.argv.slice(2));
+  const { command, flags, positional } = args;
   switch (command) {
     case "serve":
-      await cmdServe(flags);
+      await cmdServe(args);
       break;
     case "init":
-      await cmdInit(flags);
+      await cmdInit(args);
       break;
     case "doctor":
       await cmdDoctor();
@@ -751,7 +830,8 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control> [--workspace <path> ...] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]\n" +
+          "  --workspace may be repeated to register several workspace roots; CHATGPT2CODEX_WORKSPACES (one path per line) does the same.",
       );
       process.exitCode = 1;
   }
