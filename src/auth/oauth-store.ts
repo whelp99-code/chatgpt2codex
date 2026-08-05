@@ -278,6 +278,34 @@ export class JsonOAuthStore {
     });
   }
 
+  /**
+   * Revoke every issued access/refresh token while KEEPING dynamic client
+   * registrations.
+   *
+   * Rotating the owner token must invalidate anything already issued under
+   * the old secret — that is the tokens. Dropping the client registrations
+   * too is both unnecessary and actively harmful: a registration on its own
+   * grants nothing (every authorization still has to pass the owner-token
+   * form), but an MCP client like ChatGPT performs dynamic registration only
+   * once, when the connector is created, and caches the client_id forever
+   * after. Delete the registration and that cached id can never be honored
+   * again, so every later /authorize fails with a bare "Invalid client_id"
+   * and the only cure — remove and re-add the connector — is undiscoverable.
+   */
+  async clearTokens(): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.load();
+      doc.accessTokens = [];
+      doc.refreshTokens = [];
+      await this.persist(doc);
+    });
+  }
+
+  /** Number of currently registered clients (for diagnostics/CLI output). */
+  async countClients(): Promise<number> {
+    return this.locked(async () => (await this.load()).clients.length);
+  }
+
   close(): void {
     // No open handles to release for the JSON-file backend; kept for
     // interface parity with a future sqlite/worker-backed store.

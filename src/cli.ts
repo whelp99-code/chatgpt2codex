@@ -452,19 +452,37 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
     return;
   }
 
+  // Rotating the owner token revokes everything issued under the old secret.
+  // It deliberately does NOT drop dynamic client registrations: a client like
+  // ChatGPT registers once when the connector is created and caches the
+  // client_id forever, so deleting the registration bricks that connector
+  // permanently with an unexplained "Invalid client_id". See
+  // JsonOAuthStore.clearTokens.
   if (flags["set-stdin"]) {
     const token = (await readStdin()).trim();
     await storeOwnerToken(stateDir, token);
-    await new JsonOAuthStore(stateDir).clearAll();
-    console.log(JSON.stringify({ configured: true, rotated: true, stateDir }));
+    const store = new JsonOAuthStore(stateDir);
+    await store.clearTokens();
+    console.log(
+      JSON.stringify({ configured: true, rotated: true, clientsKept: await store.countClients(), stateDir }),
+    );
     return;
   }
 
   if (flags.generate || flags.rotate) {
     const ownerToken = generateOwnerToken();
     await storeOwnerToken(stateDir, ownerToken);
-    await new JsonOAuthStore(stateDir).clearAll();
-    console.log(JSON.stringify({ configured: true, rotated: true, ownerToken, stateDir }));
+    const store = new JsonOAuthStore(stateDir);
+    await store.clearTokens();
+    console.log(
+      JSON.stringify({
+        configured: true,
+        rotated: true,
+        ownerToken,
+        clientsKept: await store.countClients(),
+        stateDir,
+      }),
+    );
     return;
   }
 

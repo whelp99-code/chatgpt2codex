@@ -161,6 +161,74 @@ function isOAuthBrowserFlowPath(pathName: string): boolean {
   );
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Explains an unrecognized client_id in terms of the action that fixes it,
+ * instead of the SDK's bare {"error":"invalid_client"} JSON. */
+function unknownClientPage(clientId: string, origin: string): string {
+  return `<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Connector needs to be re-added</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+             padding:28px 16px; background:#eef3f8; color:#172033;
+             font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+      main { width:min(620px,100%); }
+      .panel { padding:clamp(22px,4vw,32px); border:1px solid #d7dee9; border-radius:14px; background:#fff; }
+      h1 { margin:0 0 6px; font-size:20px; }
+      p { line-height:1.6; margin:12px 0; }
+      ol { line-height:1.8; padding-left:20px; }
+      code { background:#f1f5f9; padding:2px 6px; border-radius:5px; font-size:13px; word-break:break-all; }
+      .muted { color:#5b6779; font-size:13px; }
+      @media (prefers-color-scheme: dark) {
+        body { background:#0f172a; color:#e2e8f0; }
+        .panel { background:#111c33; border-color:#25324a; }
+        code { background:#1c2a44; }
+        .muted { color:#94a3b8; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="panel">
+        <h1>This connector needs to be re-added</h1>
+        <p>
+          The client this authorization came from is not registered on this
+          chatgpt2codex server, so the request cannot be approved.
+        </p>
+        <p class="muted">Unrecognized client_id: <code>${escapeHtml(clientId)}</code></p>
+        <p>
+          This happens when the connector was registered against an earlier
+          setup: the client id your MCP client cached no longer exists here.
+          Registering again is the fix — it takes a few seconds.
+        </p>
+        <ol>
+          <li>Open your MCP client's connector settings (in ChatGPT: Settings → Connectors).</li>
+          <li><strong>Delete</strong> the existing chatgpt2codex connector.</li>
+          <li>Add it again using <code>${escapeHtml(origin)}/mcp</code>.</li>
+          <li>Approve with your Owner Token when prompted.</li>
+        </ol>
+        <p class="muted">
+          Editing the existing connector is not enough — registration only
+          happens when a connector is created, so it has to be removed and
+          added back.
+        </p>
+      </div>
+    </main>
+  </body>
+</html>`;
+}
+
 export interface RunningHttpServer {
   app: Express;
   config: HttpServerConfig;
@@ -231,6 +299,30 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     verifier: oauthProvider,
     requiredScopes: [config.oauth.scopes[0] ?? "chatgpt2codex"],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
+  });
+
+  // An MCP client performs dynamic registration once, when its connector is
+  // created, and caches the client_id from then on. If that registration is
+  // no longer on file — an older build wiped registrations whenever the owner
+  // token was rotated, and state can also be reset or moved — every later
+  // /authorize fails deep inside the SDK with a bare
+  // {"error":"invalid_client"} JSON body. That tells the owner nothing about
+  // the one thing that fixes it, so answer it here with a page that does.
+  app.get("/authorize", (req, res, next) => {
+    const clientId = typeof req.query.client_id === "string" ? req.query.client_id : undefined;
+    if (!clientId) {
+      next();
+      return;
+    }
+    void Promise.resolve(oauthProvider.clientsStore.getClient(clientId))
+      .then((client) => {
+        if (client) {
+          next();
+          return;
+        }
+        res.status(400).type("html").send(unknownClientPage(clientId, publicUrl.origin));
+      })
+      .catch(() => next());
   });
 
   app.use(
