@@ -190,6 +190,32 @@ start_quick_tunnel_with_retry() {
   return 1
 }
 
+# Locate an existing cloudflared config that already publishes $1.
+#
+# cloudflared only auto-discovers ~/.cloudflared/config.yml (or .yaml). A
+# perfectly good named-tunnel config saved under any other name is invisible
+# to it, so a user who has already run `cloudflared tunnel create` + `route
+# dns` still ends up on a random quick tunnel. Find such a config ourselves
+# and pass it explicitly with --config.
+find_cloudflared_config() {
+  local host="$1" candidate
+  if [[ -n "${CLOUDFLARED_CONFIG:-}" && -f "${CLOUDFLARED_CONFIG}" ]]; then
+    printf '%s\n' "$CLOUDFLARED_CONFIG"
+    return 0
+  fi
+  [[ -n "$host" ]] || return 1
+  for candidate in "$HOME/.cloudflared"/*.yml "$HOME/.cloudflared"/*.yaml; do
+    [[ -f "$candidate" ]] || continue
+    # Must name a tunnel and route the hostname we intend to serve.
+    if grep -Eq '^[[:space:]]*tunnel:[[:space:]]*[^[:space:]]' "$candidate" 2>/dev/null &&
+       grep -Eq "hostname:[[:space:]]*${host//./\\.}([[:space:]]|$)" "$candidate" 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 port_busy() {
   node -e '
     const net = require("node:net");
@@ -304,7 +330,19 @@ if [[ "$USE_TUNNEL" == "1" ]]; then
   # NAMED tunnel (a dashboard token, or a tunnel name plus credentials and a
   # DNS route). Without one, say so plainly and use the quick tunnel we can
   # actually get, so the app still ends up usable.
-  if [[ -n "$PUBLIC_HOSTNAME" && -z "${CLOUDFLARED_TUNNEL_TOKEN:-}" && -z "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
+  # Before falling back, check whether this machine already has a named-tunnel
+  # config for the requested hostname. If it does, that is exactly what the
+  # user wants and it just was not being used.
+  CF_CONFIG=""
+  if [[ -n "$PUBLIC_HOSTNAME" && -z "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
+    if CF_CONFIG="$(find_cloudflared_config "$PUBLIC_HOSTNAME")"; then
+      echo "[chatgpt2codex] using existing Cloudflare tunnel config: $CF_CONFIG"
+    else
+      CF_CONFIG=""
+    fi
+  fi
+
+  if [[ -n "$PUBLIC_HOSTNAME" && -z "$CF_CONFIG" && -z "${CLOUDFLARED_TUNNEL_TOKEN:-}" && -z "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
     echo "[chatgpt2codex] warning: '$PUBLIC_HOSTNAME' cannot be published without a named Cloudflare tunnel." >&2
     echo "[chatgpt2codex] warning: cloudflared ignores --hostname unless a tunnel token/name is configured." >&2
     echo "[chatgpt2codex] warning: using a temporary quick tunnel for this run instead." >&2
@@ -316,10 +354,14 @@ if [[ "$USE_TUNNEL" == "1" ]]; then
     PUBLIC_HOSTNAME=""
   fi
 
-  if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
+  if [[ -n "$CF_CONFIG" || -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
     PUBLIC_URL="https://${PUBLIC_HOSTNAME}"
     if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
       cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN" >"$CFLOG" 2>&1 &
+    elif [[ -n "$CF_CONFIG" ]]; then
+      # The config supplies both the tunnel id and the ingress rules. Passing
+      # --url here as well would conflict with those rules, so do not.
+      cloudflared --config "$CF_CONFIG" tunnel --no-autoupdate run >"$CFLOG" 2>&1 &
     else
       cloudflared tunnel --no-autoupdate run --url "http://127.0.0.1:$PORT" "$CLOUDFLARED_TUNNEL_NAME" >"$CFLOG" 2>&1 &
     fi
