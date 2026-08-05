@@ -181,6 +181,21 @@ port_busy() {
   ' "$PORT"
 }
 
+wait_port_free() {
+  # A restart terminates the previous server and starts a new one straight
+  # away, but the old process can hold the listening socket for a second or
+  # two while it shuts down. Give it that time instead of failing outright.
+  local tries="${1:-20}"
+  local i
+  for i in $(seq 1 "$tries"); do
+    if ! port_busy; then
+      return 0
+    fi
+    sleep_1s
+  done
+  return 1
+}
+
 stop_stale_runtime_processes() {
   local stopped=()
   local patterns=(
@@ -223,8 +238,11 @@ if [[ ! -f "$ROOT/dist/cli.js" ]]; then
 fi
 
 stop_stale_runtime_processes
-if port_busy; then
-  echo "[chatgpt2codex] port $PORT is already in use. Set PORT=xxxx or stop the other process." >&2
+if ! wait_port_free 20; then
+  echo "[chatgpt2codex] port $PORT is already in use and did not free up." >&2
+  echo "[chatgpt2codex] Something else is listening on 127.0.0.1:$PORT. Find it with:" >&2
+  echo "[chatgpt2codex]   lsof -nP -iTCP:$PORT -sTCP:LISTEN" >&2
+  echo "[chatgpt2codex] Then stop it, or start on another port with PORT=xxxx." >&2
   exit 1
 fi
 
@@ -243,11 +261,20 @@ fi
 if [[ "$USE_TUNNEL" == "1" ]]; then
   need_cmd cloudflared
   echo "[chatgpt2codex] 1/3 starting public tunnel..."
+  # A named/token tunnel needs a hostname to publish under. Missing one used
+  # to abort the whole launch, so a stale tunnel name left over in settings
+  # made the app fail to start every single time with no way to recover from
+  # the UI. Warn and fall back to a temporary quick tunnel instead: the user
+  # still gets a working connector URL, and the warning says what to fix.
+  if [[ -z "$PUBLIC_HOSTNAME" && ( -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ) ]]; then
+    echo "[chatgpt2codex] warning: a Cloudflare tunnel name/token is configured but PUBLIC_HOSTNAME is empty." >&2
+    echo "[chatgpt2codex] warning: set the public hostname in Settings (or clear the tunnel name)." >&2
+    echo "[chatgpt2codex] warning: falling back to a temporary quick tunnel for this run." >&2
+    CLOUDFLARED_TUNNEL_TOKEN=""
+    CLOUDFLARED_TUNNEL_NAME=""
+  fi
+
   if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
-    if [[ -z "$PUBLIC_HOSTNAME" ]]; then
-      echo "[chatgpt2codex] PUBLIC_HOSTNAME is required when using CLOUDFLARED_TUNNEL_TOKEN or CLOUDFLARED_TUNNEL_NAME." >&2
-      exit 1
-    fi
     PUBLIC_URL="https://${PUBLIC_HOSTNAME}"
     if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
       cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN" >"$CFLOG" 2>&1 &

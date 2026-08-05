@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 import Security
 
@@ -72,6 +73,8 @@ private let desktopLocalizationRows: [String: [String]] = [
     "settingsMenu": ["Settings...", "설정...", "設定...", "设置...", "設定...", "Ajustes...", "Réglages...", "Einstellungen...", "Configurações...", "Impostazioni...", "Instellingen...", "Ustawienia...", "Настройки...", "Ayarlar...", "Cài đặt...", "Pengaturan...", "การตั้งค่า...", "الإعدادات...", "सेटिंग्स...", "Налаштування..."],
     "launchAtLoginMenu": ["Launch at Login", "로그인 시 실행", "ログイン時に起動", "登录时启动", "登入時啟動", "Iniciar al acceder", "Lancer à la connexion", "Beim Anmelden starten", "Abrir ao iniciar sessão", "Avvia al login", "Start bij inloggen", "Uruchamiaj przy logowaniu", "Запускать при входе", "Girişte başlat", "Mở khi đăng nhập", "Jalankan saat login", "เปิดเมื่อเข้าสู่ระบบ", "التشغيل عند تسجيل الدخول", "लॉगिन पर शुरू करें", "Запускати під час входу"],
     "startOnOpenMenu": ["Start MCP When App Opens", "앱 열 때 MCP 시작", "アプリ起動時に MCP を開始", "应用打开时启动 MCP", "App 開啟時啟動 MCP", "Iniciar MCP al abrir la app", "Démarrer MCP à l'ouverture", "MCP beim Öffnen starten", "Iniciar MCP ao abrir o app", "Avvia MCP all'apertura", "Start MCP bij openen", "Uruchamiaj MCP przy otwarciu", "Запускать MCP при открытии", "Uygulama açılınca MCP başlat", "Khởi động MCP khi mở ứng dụng", "Mulai MCP saat app dibuka", "เริ่ม MCP เมื่อเปิดแอป", "بدء MCP عند فتح التطبيق", "ऐप खुलने पर MCP शुरू करें", "Запускати MCP під час відкриття"],
+    "ownerTokenRequiredTitle": ["Owner Token required", "오너 토큰이 필요합니다"],
+    "ownerTokenRequiredInfo": ["MCP cannot start until an Owner Token exists. In the Settings window that opens next, click \"Generate Owner Token\", keep the copied value somewhere safe, then click Start MCP again.", "오너 토큰이 없으면 MCP를 시작할 수 없습니다. 이어서 열리는 설정 창에서 \"오너 토큰 생성\"을 누르고 복사된 값을 안전한 곳에 보관한 뒤, 다시 Start MCP를 누르세요."],
     "screenshotPermissionMenu": ["Screenshot Permission...", "스크린샷 권한..."],
     "screenshotPermissionTitle": ["Screen Recording permission", "화면 기록 권한"],
     "screenshotPermissionMissingInfo": ["ChatGPT To Codex needs macOS Screen Recording permission to capture E2E screenshots and show them inline in ChatGPT. Enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then restart the app if macOS asks for it.", "E2E 스크린샷을 찍고 ChatGPT 답변에 인라인으로 보여주려면 macOS 화면 기록 권한이 필요합니다. 시스템 설정 > 개인정보 보호 및 보안 > 화면 기록에서 ChatGPT To Codex를 허용하고, macOS가 요청하면 앱을 재시작하세요."],
@@ -701,8 +704,25 @@ private final class ServiceController {
         return discoverQuickTunnelBaseURL()
     }
 
+    var loopbackBaseURL: URL {
+        URL(string: "http://127.0.0.1:\(port)")!
+    }
+
+    /// The URL to register in an MCP client.
+    ///
+    /// This used to be nil whenever the public tunnel was off, which made
+    /// "Copy Connector URL" a menu item that silently did nothing — the most
+    /// confusing possible failure for someone trying to finish setup. In
+    /// loopback mode the local `/mcp` URL is the correct thing to copy; only
+    /// ChatGPT *web* needs the tunnel. So always return something copyable.
     var connectorURL: URL? {
-        publicBaseURL?.appendingPathComponent("mcp")
+        (publicBaseURL ?? loopbackBaseURL).appendingPathComponent("mcp")
+    }
+
+    /// True only when the connector URL is reachable from ChatGPT web, i.e.
+    /// a public tunnel is actually up. Drives the "Open Public Health" item.
+    var hasPublicConnectorURL: Bool {
+        publicBaseURL != nil
     }
 
     var publicHealthURL: URL? {
@@ -764,8 +784,11 @@ private final class ServiceController {
 
     func restart(completion: @escaping (Bool) -> Void) {
         stop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            self.start(completion: completion)
+        // Wait for the old server to actually release port `port` (up to 15s)
+        // rather than assuming a flat 1s is enough. Starting too early is what
+        // produced the EADDRINUSE crash the new server could not recover from.
+        waitForPortRelease(deadline: Date().addingTimeInterval(15)) { [weak self] in
+            self?.start(completion: completion)
         }
     }
 
@@ -777,6 +800,18 @@ private final class ServiceController {
             ])
         }
 
+        // A tunnel name only means anything when the public tunnel is on. It
+        // used to be exported unconditionally and never unset, so a name left
+        // over in Settings kept forcing tunnel mode even with the toggle off —
+        // and the launcher then aborted because no hostname was configured.
+        // Every run now states both variables explicitly.
+        let tunnelNameLine: String
+        if enablePublicTunnel, let cloudflaredTunnelName {
+            tunnelNameLine = "export CLOUDFLARED_TUNNEL_NAME=\(shellQuote(cloudflaredTunnelName))"
+        } else {
+            tunnelNameLine = "unset CLOUDFLARED_TUNNEL_NAME"
+        }
+
         let command = """
         cd \(shellQuote(runtimeRoot.path))
         export PATH=\(shellQuote(runtimeRoot.appendingPathComponent("bin").path))":$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
@@ -784,7 +819,7 @@ private final class ServiceController {
         export PORT=\(port)
         \(enablePublicTunnel ? "export CHATGPT2CODEX_EXPOSE_WEB=1" : "unset CHATGPT2CODEX_EXPOSE_WEB")
         \(publicHost.map { "export PUBLIC_HOSTNAME=\(shellQuote($0))" } ?? "unset PUBLIC_HOSTNAME")
-        \(cloudflaredTunnelName.map { "export CLOUDFLARED_TUNNEL_NAME=\(shellQuote($0))" } ?? "")
+        \(tunnelNameLine)
         \(activeProjectRoot.map { "export CHATGPT2CODEX_ACTIVE_PROJECT_ROOT=\(shellQuote($0))" } ?? "")
         exec /bin/bash \(shellQuote(script.path))
         """
@@ -796,6 +831,10 @@ private final class ServiceController {
         if !FileManager.default.fileExists(atPath: logFile.path) {
             FileManager.default.createFile(atPath: logFile.path, contents: nil)
         }
+        // Everything already in the log belongs to earlier runs; record where
+        // this run starts so a dead tunnel URL from a previous session can
+        // never be handed back as the current connector URL.
+        markLogScanFloor()
         let logHandle = try FileHandle(forWritingTo: logFile)
         try logHandle.seekToEnd()
         let pipe = Pipe()
@@ -840,10 +879,20 @@ private final class ServiceController {
         }
     }
 
+    /// Scrape the quick-tunnel URL out of the launcher's output.
+    ///
+    /// The log file is append-only and never truncated, so scanning the whole
+    /// file returned the last URL *ever* seen — including one from a previous
+    /// session whose tunnel is long dead. Copying that into ChatGPT produces
+    /// exactly the "MCP connection failed" the user cannot explain, because
+    /// the URL looks perfectly valid. Only bytes written since the current
+    /// launch are considered, so a run that produced no tunnel reports no URL
+    /// instead of resurrecting a stale one.
     private func discoverQuickTunnelBaseURL() -> URL? {
-        guard let data = try? Data(contentsOf: logFile),
-              let text = String(data: data, encoding: .utf8),
-              let regex = try? NSRegularExpression(pattern: #"https://[A-Za-z0-9.-]+\.trycloudflare\.com"#)
+        guard let data = try? Data(contentsOf: logFile) else { return nil }
+        let fresh = logScanFloor <= data.count ? data.subdata(in: logScanFloor..<data.count) : data
+        guard let text = String(data: fresh, encoding: .utf8),
+              let regex = try? NSRegularExpression(pattern: #"https://[A-Za-z0-9-]+\.trycloudflare\.com"#)
         else {
             return nil
         }
@@ -854,6 +903,54 @@ private final class ServiceController {
             return nil
         }
         return URL(string: String(text[matchRange]))
+    }
+
+    /// Byte offset into `logFile` marking the start of the current launch.
+    /// Everything before it belongs to earlier runs and must be ignored when
+    /// discovering the live tunnel URL.
+    private var logScanFloor = 0
+
+    private func markLogScanFloor() {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: logFile.path)
+        logScanFloor = (attributes?[.size] as? Int) ?? 0
+    }
+
+    /// Whether anything is currently listening on the loopback port.
+    ///
+    /// `stop()` only sends SIGTERM (via a detached pkill) and returns
+    /// immediately, so the old server can still own the socket for a second
+    /// or two. Starting the replacement before it lets go made the new
+    /// process die on EADDRINUSE — the restart loop behind "Restart MCP never
+    /// comes back". Poll instead of guessing with a fixed delay.
+    private func portIsFree() -> Bool {
+        guard let checkPort = UInt16(exactly: port) else { return true }
+        let socketFD = socket(AF_INET, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { return true }
+        defer { close(socketFD) }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = checkPort.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+        let connectResult = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(socketFD, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        // connect() succeeding means something accepted us: the port is taken.
+        return connectResult != 0
+    }
+
+    private func waitForPortRelease(deadline: Date, completion: @escaping () -> Void) {
+        if portIsFree() || Date() >= deadline {
+            completion()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.waitForPortRelease(deadline: deadline, completion: completion)
+        }
     }
 
     func checkForUpdates(completion: @escaping (String, URL?) -> Void) {
@@ -1004,6 +1101,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
         if controller.startMCPOnLaunch {
             if !controller.ownerTokenConfigured() {
+                warnOwnerTokenMissing()
                 showSettings()
                 return
             }
@@ -1116,11 +1214,25 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             self.toggleItem.image = self.symbol(ok || self.controller.isManagedProcessRunning ? "stop.circle" : "play.circle")
             self.toggleItem.keyEquivalent = ok || self.controller.isManagedProcessRunning ? "x" : "s"
             self.restartItem.isEnabled = true
-            let hasPublicURL = self.controller.connectorURL != nil
-            self.openPublicHealthItem.isEnabled = hasPublicURL
-            self.copyConnectorItem.isEnabled = hasPublicURL
+            // "Open Public Health" only makes sense behind a live tunnel, but
+            // the connector URL is always copyable (loopback in local mode) —
+            // these are no longer the same condition.
+            self.openPublicHealthItem.isEnabled = self.controller.hasPublicConnectorURL
+            self.copyConnectorItem.isEnabled = self.controller.connectorURL != nil
             self.statusItem.button?.toolTip = String(format: self.t("tooltipState"), state)
         }
+    }
+
+    /// Explain why the server cannot start yet, instead of bouncing the user
+    /// back into Settings with no message.
+    private func warnOwnerTokenMissing() {
+        let alert = NSAlert()
+        alert.messageText = t("ownerTokenRequiredTitle")
+        alert.informativeText = t("ownerTokenRequiredInfo")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("ok"))
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func toggleServer() {
@@ -1131,6 +1243,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             }
         } else {
             if !controller.ownerTokenConfigured() {
+                // Previously this silently reopened Settings, so "Start MCP"
+                // looked like it did nothing but bounce you back into setup —
+                // repeatedly, with no clue what was missing. Say what is
+                // wrong before showing the window.
+                warnOwnerTokenMissing()
                 showSettings()
                 return
             }

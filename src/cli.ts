@@ -12,9 +12,11 @@
 
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import type { Server as HttpListener } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { Express } from "express";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
 import { findProject, scanWorkspace } from "./workspace/registry.js";
@@ -79,7 +81,18 @@ function defaultConfig(workspaceRoot: string, stateDir: string): Config {
   };
 }
 
-async function buildToolContext(workspace: string): Promise<ToolContext> {
+/**
+ * Build a ToolContext for `workspace`.
+ *
+ * `persistRegistry: false` makes this a read-only probe: the workspace is
+ * still scanned so the caller sees an accurate registry, but the result is
+ * NOT written to `<stateDir>/projects.json`. `doctor` uses that mode — it
+ * runs from whatever directory it happens to be invoked in (the launcher
+ * runs it from the app bundle's runtime folder), and persisting that scan
+ * would replace the user's real project registry with a scan of the app
+ * bundle.
+ */
+async function buildToolContext(workspace: string, persistRegistry = true): Promise<ToolContext> {
   const workspaceRoot = path.resolve(workspace);
   const stateDir = defaultStateDir();
 
@@ -87,7 +100,7 @@ async function buildToolContext(workspace: string): Promise<ToolContext> {
   const ledger = new Ledger(stateDir);
 
   const registry = await scanWorkspace(workspaceRoot);
-  await store.saveProjects(registry);
+  if (persistRegistry) await store.saveProjects(registry);
 
   const config = defaultConfig(workspaceRoot, stateDir);
 
@@ -168,8 +181,109 @@ async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<v
  * HTTP mode (PRD §4 Transport Gateway, §5 CLI): `chatgpt2codex serve --http
  * [--port 7979] [--public-url <origin>]`. Exposes the SAME registerTools(ctx)
  * catalog as stdio mode over a Streamable HTTP `/mcp` endpoint, gated by
- * OAuth 2.1 (see src/server/http.ts, src/auth/oauth-provider.ts).
+ * OAuth 2.1 (see src/server/http.ts, src/auth/oauth-provider.ts). Entry point
+ * is cmdServeHttp() below; the helpers directly beneath this comment exist to
+ * make its bind step survivable.
  */
+
+/** How long to keep retrying a bind that fails with EADDRINUSE, and how
+ * often. A restart (menu bar "Restart MCP", or the launcher's stale-runtime
+ * cleanup) terminates the previous server and immediately starts a new one;
+ * the old process can still hold the listening socket for a second or two
+ * while it shuts down. Without this the new server used to die instantly and,
+ * under any supervisor, crash-loop forever. */
+const LISTEN_RETRY_INTERVAL_MS = 500;
+
+function listenRetryTotalMs(): number {
+  const raw = process.env.CHATGPT2CODEX_LISTEN_RETRY_MS;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return 15_000;
+}
+
+interface ListenFailure {
+  code: string;
+  message: string;
+}
+
+/**
+ * `app.listen()` reports bind failures by emitting an `error` event on the
+ * returned server, NOT by throwing. With no `error` listener attached, Node
+ * rethrows it as an unhandled `error` event and the process dies with a raw
+ * stack trace — which is how a busy port turned into an endless
+ * start/crash/restart loop that never served a single request.
+ *
+ * This wrapper always attaches the listener, retries EADDRINUSE for a bounded
+ * window so a normal restart survives the old process letting go of the port,
+ * and resolves with a typed failure instead of throwing so the caller can
+ * print something a human can act on.
+ */
+async function listenOrExplain(
+  app: Express,
+  port: number,
+  host: string,
+): Promise<{ ok: true; server: HttpListener } | { ok: false; failure: ListenFailure }> {
+  const retryWindowMs = listenRetryTotalMs();
+  const deadline = Date.now() + retryWindowMs;
+  let announcedWait = false;
+
+  for (;;) {
+    const attempt = await new Promise<{ ok: true; server: HttpListener } | { ok: false; failure: ListenFailure }>(
+      (resolve) => {
+        const server = app.listen(port, host);
+        const onError = (err: NodeJS.ErrnoException) => {
+          server.removeListener("listening", onListening);
+          resolve({ ok: false, failure: { code: err.code ?? "UNKNOWN", message: err.message } });
+        };
+        const onListening = () => {
+          server.removeListener("error", onError);
+          resolve({ ok: true, server });
+        };
+        server.once("error", onError);
+        server.once("listening", onListening);
+      },
+    );
+
+    if (attempt.ok) return attempt;
+    if (attempt.failure.code !== "EADDRINUSE" || Date.now() >= deadline) return attempt;
+
+    if (!announcedWait) {
+      announcedWait = true;
+      console.error(
+        `chatgpt2codex serve --http: port ${port} is still held by a previous instance; ` +
+          `waiting up to ${Math.round(retryWindowMs / 1000)}s for it to shut down...`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, LISTEN_RETRY_INTERVAL_MS));
+  }
+}
+
+function explainListenFailure(failure: ListenFailure, port: number, host: string): string {
+  switch (failure.code) {
+    case "EADDRINUSE":
+      return [
+        `chatgpt2codex serve --http: port ${port} is already in use and did not free up.`,
+        `Another chatgpt2codex server (or another app) is listening on ${host}:${port}.`,
+        `Fix: stop it, or start on a different port with PORT=<other> / --port <other>.`,
+        `Find the process with:  lsof -nP -iTCP:${port} -sTCP:LISTEN`,
+      ].join("\n");
+    case "EACCES":
+      return [
+        `chatgpt2codex serve --http: not allowed to bind ${host}:${port}.`,
+        `Ports below 1024 need elevated privileges — pick a port above 1024.`,
+      ].join("\n");
+    case "EADDRNOTAVAIL":
+      return [
+        `chatgpt2codex serve --http: the address ${host} does not exist on this machine.`,
+        `Use --host 127.0.0.1 unless you specifically need another interface.`,
+      ].join("\n");
+    default:
+      return `chatgpt2codex serve --http: could not listen on ${host}:${port} (${failure.code}): ${failure.message}`;
+  }
+}
+
 async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const ctx = await buildToolContext(workspace);
@@ -194,7 +308,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   await applyStartupProjectSelection(ctx, flags);
   if (isControlEnabled()) startExecutor(ctx);
 
-  let httpServer: ReturnType<ReturnType<typeof createHttpServer>["app"]["listen"]> | undefined;
+  let httpServer: HttpListener | undefined;
   let closeHttpServer: () => void = () => undefined;
   let shuttingDown = false;
   const shutdown = (exitCode = 0) => {
@@ -222,14 +336,42 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   const { app } = running;
   closeHttpServer = running.close;
 
-  httpServer = app.listen(port, host, () => {
-    console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);
-    console.error(`chatgpt2codex serve --http: public URL ${publicUrl}/mcp`);
-    console.error(`chatgpt2codex serve --http: workspace=${ctx.workspaceRoot}`);
-    if (idleShutdownMs !== undefined) {
-      console.error(`chatgpt2codex serve --http: idle shutdown after ${idleShutdownMinutes} minute(s) without sessions`);
-    }
+  const listened = await listenOrExplain(app, port, host);
+  if (!listened.ok) {
+    // The bind failed. Report why, record it as a distinct ledger event, and
+    // exit non-zero WITHOUT logging workspace.opened — that event must only
+    // ever mean "this server is actually accepting connections", otherwise
+    // the audit trail fills up with phantom startups (one per crash) and
+    // hides the real problem.
+    console.error(explainListenFailure(listened.failure, port, host));
+    closeHttpServer();
+    await ctx.ledger
+      .append({
+        type: "server.listen_failed",
+        transport: "http",
+        host,
+        port,
+        code: listened.failure.code,
+      })
+      .catch(() => undefined);
+    process.exitCode = 1;
+    return;
+  }
+
+  httpServer = listened.server;
+  // A socket that is already listening can still fail later (rare, but a
+  // network interface going away will do it). Keep a handler attached so it
+  // is reported rather than killing the process with a bare stack trace.
+  httpServer.on("error", (err: NodeJS.ErrnoException) => {
+    console.error(`chatgpt2codex serve --http: server error (${err.code ?? "UNKNOWN"}): ${err.message}`);
   });
+
+  console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);
+  console.error(`chatgpt2codex serve --http: public URL ${publicUrl}/mcp`);
+  console.error(`chatgpt2codex serve --http: workspace=${ctx.workspaceRoot}`);
+  if (idleShutdownMs !== undefined) {
+    console.error(`chatgpt2codex serve --http: idle shutdown after ${idleShutdownMinutes} minute(s) without sessions`);
+  }
 
   await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot, transport: "http" });
 
@@ -533,7 +675,10 @@ async function cmdDoctor(): Promise<void> {
   try {
     // Import lazily so a broken registration path doesn't crash doctor.
     const { createServer } = await import("./server/mcp-server.js");
-    const ctx = await buildToolContext(workspacePath);
+    // Read-only: doctor runs from whatever directory invoked it (the macOS
+    // launcher runs it from inside the app bundle), so it must never write
+    // that scan over the user's real projects.json.
+    const ctx = await buildToolContext(workspacePath, false);
     const server = await createServer(ctx);
     const serverAny = server as unknown as {
       _registeredTools?: Record<string, unknown>;
@@ -594,7 +739,25 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * Last-resort guards. Anything that escapes to here would otherwise kill the
+ * process with a bare stack trace and — under a supervisor that restarts it —
+ * turn a single recoverable fault into an endless restart loop. Reporting the
+ * cause is what makes such a loop diagnosable instead of silent.
+ */
+process.on("uncaughtException", (err: unknown) => {
+  console.error("chatgpt2codex: uncaught exception —", err instanceof Error ? (err.stack ?? err.message) : String(err));
+  process.exitCode = 1;
+});
+process.on("unhandledRejection", (reason: unknown) => {
+  console.error(
+    "chatgpt2codex: unhandled promise rejection —",
+    reason instanceof Error ? (reason.stack ?? reason.message) : String(reason),
+  );
+  process.exitCode = 1;
+});
+
 main().catch((err: unknown) => {
-  console.error(err instanceof Error ? err.stack ?? err.message : String(err));
+  console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
   process.exitCode = 1;
 });
