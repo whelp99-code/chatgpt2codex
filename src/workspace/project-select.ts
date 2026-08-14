@@ -5,6 +5,7 @@ import {
   type Lease,
   type LeasePreset,
   type ProjectRegistryEntry,
+  type SessionSummary,
 } from "../types.js";
 
 /** Default lease TTL when no config is threaded in (PRD §7 Project Lease). */
@@ -24,6 +25,112 @@ export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset): Lea
     issuedAt,
     expiresAt: issuedAt + DEFAULT_LEASE_TTL_MS,
   };
+}
+
+/**
+ * Cross-session lease conflict, as reported to the caller that lost the race.
+ * Carries who holds the project and until when so the message can say more
+ * than "denied" — otherwise there is no way to tell an occupied project from
+ * a preset that is simply too weak.
+ */
+export interface WriteLockHolder {
+  slot: string;
+  sessionKey: string;
+  heldSince: number;
+  expiresAt: number;
+}
+
+/** Presets whose capability set includes `write`. Kept in sync with
+ * ALLOWED_CAPABILITIES in lease-guard.ts, which is the source of truth. */
+const WRITE_PRESETS: ReadonlySet<LeasePreset> = new Set<LeasePreset>(["full-write"]);
+/** Presets that can run project commands/tests. */
+const VERIFY_PRESETS: ReadonlySet<LeasePreset> = new Set<LeasePreset>([
+  "tests-only",
+  "full-write",
+]);
+
+function isLive(lease: Lease | null, projectId: string, now: number): lease is Lease {
+  return lease !== null && lease.projectId === projectId && lease.expiresAt >= now;
+}
+
+/**
+ * Find a live write lease held on `projectId` by a session other than
+ * `selfSessionKey`.
+ *
+ * Only unexpired leases count. A stale entry left behind by a crashed or
+ * disconnected client must never lock the owner out of their own project —
+ * expiry is the backstop for the case where `transport.onclose` never fired.
+ */
+export function findWriteLockHolder(
+  sessions: readonly SessionSummary[],
+  projectId: string,
+  selfSessionKey: string,
+  now: number = Date.now(),
+): WriteLockHolder | undefined {
+  for (const session of sessions) {
+    if (session.sessionKey === selfSessionKey) continue;
+    const { lease } = session;
+    if (!isLive(lease, projectId, now)) continue;
+    if (!WRITE_PRESETS.has(lease.preset)) continue;
+    return {
+      slot: session.slot,
+      sessionKey: session.sessionKey,
+      heldSince: lease.issuedAt,
+      expiresAt: lease.expiresAt,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Slots of other live sessions that can also run tests on `projectId`.
+ *
+ * Concurrent test runs are allowed rather than blocked — tests are re-runnable
+ * and blocking a second look at a project is more disruptive than the risk.
+ * They are reported so a run that fails on a port clash or a half-written
+ * build directory can be explained instead of looking random.
+ */
+export function findVerifyPeers(
+  sessions: readonly SessionSummary[],
+  projectId: string,
+  selfSessionKey: string,
+  now: number = Date.now(),
+): string[] {
+  const peers: string[] = [];
+  for (const session of sessions) {
+    if (session.sessionKey === selfSessionKey) continue;
+    const { lease } = session;
+    if (!isLive(lease, projectId, now)) continue;
+    if (VERIFY_PRESETS.has(lease.preset)) peers.push(session.slot);
+  }
+  return peers;
+}
+
+/** Throw PROJECT_LOCKED when another live session already holds the write
+ * lease. Called both when a lease is issued (fail fast, before the model
+ * plans work it cannot do) and again at write time as a second line. */
+export function assertWritable(
+  sessions: readonly SessionSummary[],
+  projectId: string,
+  projectLabel: string,
+  selfSessionKey: string,
+  now: number = Date.now(),
+): void {
+  const holder = findWriteLockHolder(sessions, projectId, selfSessionKey, now);
+  if (!holder) return;
+  const until = new Date(holder.expiresAt).toISOString().slice(11, 16);
+  throw new DomainError(
+    ErrorCode.PROJECT_LOCKED,
+    `${projectLabel} is being edited by another session (slot ${holder.slot}, until ${until} UTC). ` +
+      `Close that conversation or wait for its lease to expire, or select this project read-only.`,
+    {
+      projectId,
+      heldBySlot: holder.slot,
+      heldSince: holder.heldSince,
+      expiresAt: holder.expiresAt,
+      holderPreset: "full-write",
+    },
+  );
 }
 
 /** Shape session state is expected to carry the active lease under (PRD §10 sessions.json). */
