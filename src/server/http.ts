@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { ToolContext } from "../types.js";
+import { STDIO_SESSION_KEY } from "../types.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provider.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
@@ -391,6 +392,12 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     }
   }
 
+  // No transport from a previous process can still be live, so any session
+  // left in sessions.json is stale. Clearing them at startup stops a write
+  // lease that outlived a crash from locking the owner out of their own
+  // project until it expired.
+  void ctx.store.sweepSessions?.(null);
+
   const sweepInterval = setInterval(() => {
     const now = Date.now();
     for (const [id, session] of sessions) {
@@ -399,6 +406,9 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         sessions.delete(id);
       }
     }
+    // Keep persisted leases in step with live transports: a session that went
+    // away without a clean close must not keep holding its project.
+    void ctx.store.sweepSessions?.([...sessions.keys()]);
     if (
       config.idleShutdownMs !== undefined &&
       config.idleShutdownMs > 0 &&
@@ -467,7 +477,20 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         // refused here even when the desktop-control tools are exposed to
         // ChatGPT (see src/server/tools.ts project_select handler /
         // isControlChatGptExposed) — lease arming stays local-only (stdio).
-        const mcpServer = await createMcpServer({ ...ctx, remote: true });
+        //
+        // sessionKey is a getter because the transport only receives its id
+        // during initialize, which happens after connect() below. Every tool
+        // call arrives later still, so by the time anything reads this the id
+        // is populated; binding the value eagerly here would capture
+        // undefined and collapse all sessions back onto one shared lease.
+        const sessionScopedCtx: ToolContext = {
+          ...ctx,
+          remote: true,
+          get sessionKey(): string {
+            return transport?.sessionId ?? STDIO_SESSION_KEY;
+          },
+        };
+        const mcpServer = await createMcpServer(sessionScopedCtx);
         await mcpServer.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");

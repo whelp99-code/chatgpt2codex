@@ -30,8 +30,11 @@ function workspaceRootsOf(ctx: ToolContext): string[] {
   if (Array.isArray(roots) && roots.length > 0) return roots;
   return ctx.workspaceRoot ? [ctx.workspaceRoot] : [];
 }
-import { makeLease } from "../workspace/project-select.js";
+import { assertWritable, makeLease } from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
+
+/** Presets that grant `write`; only these contend for the exclusive lock. */
+const WRITE_CAPABLE_PRESETS: ReadonlySet<LeasePreset> = new Set<LeasePreset>(["full-write"]);
 import { codeSearch } from "../code/search.js";
 import { readSlice } from "../code/read-slice.js";
 import { applyPatch, createFile } from "../code/patch.js";
@@ -90,7 +93,7 @@ function emptySession(): SessionState {
 }
 
 async function loadSession(ctx: ToolContext): Promise<SessionState> {
-  const raw = await ctx.store.getSession();
+  const raw = await ctx.store.getSession(ctx.sessionKey);
   if (!raw || typeof raw !== "object") return emptySession();
   const s = raw as Partial<SessionState>;
   return {
@@ -101,7 +104,7 @@ async function loadSession(ctx: ToolContext): Promise<SessionState> {
 }
 
 async function saveSession(ctx: ToolContext, session: SessionState): Promise<void> {
-  await ctx.store.setSession(session);
+  await ctx.store.setSession(session, ctx.sessionKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,6 +1372,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             { preset },
           );
         }
+        // Writes are exclusive across sessions: refuse here, before the model
+        // starts planning edits it will not be allowed to make. Reads and test
+        // runs stay shared, so a second conversation can still inspect a
+        // project someone else is editing.
+        if (WRITE_CAPABLE_PRESETS.has(preset) && ctx.store.listSessions) {
+          const sessions = await ctx.store.listSessions();
+          assertWritable(sessions, entry.projectId, entry.name, ctx.sessionKey);
+        }
+
         const lease = makeLease(entry, preset);
 
         await saveSession(ctx, {

@@ -19,6 +19,7 @@ import { promisify } from "node:util";
 import type { Express } from "express";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
+import { STDIO_SESSION_KEY } from "./types.js";
 import { findProject, scanWorkspaces } from "./workspace/registry.js";
 import { makeLease } from "./workspace/project-select.js";
 import { Store } from "./state/store.js";
@@ -173,10 +174,17 @@ async function buildToolContext(workspaceRoots: string[], persistRegistry = true
     store: {
       loadProjects: () => store.loadProjects(),
       saveProjects: (p) => store.saveProjects(p),
-      getSession: () => store.getSession(),
-      setSession: (s) => store.setSession(s),
+      getSession: (sessionKey) => store.getSession(sessionKey),
+      setSession: (s, sessionKey) => store.setSession(s, sessionKey),
+      listSessions: () => store.listSessions(),
+      getDefaults: () => store.getDefaults(),
+      setDefaults: (d) => store.setDefaults(d),
+      sweepSessions: (liveKeys) => store.sweepSessions(liveKeys),
     },
     config,
+    // Local/stdio callers share one key; src/server/http.ts overrides this
+    // per connected MCP session.
+    sessionKey: STDIO_SESSION_KEY,
   };
 }
 
@@ -216,10 +224,13 @@ async function applyStartupProjectSelection(ctx: ToolContext, flags: Record<stri
   }
 
   const preset = parseLeasePreset(flags["active-project-preset"]);
-  const lease = makeLease(entry, preset);
-  await ctx.store.setSession({ activeProjectId: entry.projectId, mode: "read", lease });
+  // Record a default rather than minting a lease. A startup lease belonged to
+  // no session — nothing had connected yet — but was visible to every session,
+  // which is exactly the shared-lease problem per-session leases remove. Now a
+  // new conversation inherits this project only until it selects its own.
+  await ctx.store.setDefaults?.({ activeProjectId: entry.projectId, preset });
   await ctx.ledger.append({
-    type: "project.selected",
+    type: "project.default.set",
     projectId: entry.projectId,
     reason: "startup active project",
     preset,
@@ -477,7 +488,8 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     console.error(`chatgpt2codex init: skipping unreadable workspace root ${failure.root} (${failure.reason})`);
   }
   await store.saveProjects(registry);
-  await store.setSession({ activeProjectId: null, mode: "observe", lease: null });
+  // Clear every persisted session: none can still be live across an init.
+  await store.sweepSessions(null);
   for (const root of workspaceRoots) {
     await ledger.append({ type: "workspace.opened", workspaceRoot: root });
   }
