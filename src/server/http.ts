@@ -16,6 +16,7 @@ import { createServer as createMcpServer } from "./mcp-server.js";
 import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provider.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
+import { registerAdminRoutes } from "./admin.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -350,6 +351,14 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
 
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "chatgpt2codex" });
+  });
+
+  // Owner-only status surface. Registered here rather than behind the MCP
+  // bearer middleware because the dashboard is opened by a browser, which
+  // cannot set an Authorization header on a top-level navigation.
+  registerAdminRoutes(app, ctx, {
+    maxSlots: config.maxSessions,
+    secureCookies: publicUrl.protocol === "https:",
   });
 
   app.get("/privacy", (_req, res) => {
