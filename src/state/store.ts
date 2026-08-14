@@ -2,7 +2,14 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { DomainError, ErrorCode, type ProjectRegistryEntry } from "../types.js";
+import {
+  DomainError,
+  ErrorCode,
+  STDIO_SESSION_KEY,
+  type ProjectRegistryEntry,
+  type SessionDefaults,
+  type SessionSummary,
+} from "../types.js";
 
 /**
  * Central state store under `~/.local/share/chatgpt2codex/` (PRD §10):
@@ -42,25 +49,77 @@ const ProjectsFileSchema = z.object({
 
 type ProjectsFile = z.infer<typeof ProjectsFileSchema>;
 
-/** Session document shape (active project, mode, lease) — PRD §6, §7. */
+/** `control` was missing from this list while LeasePreset (src/types.ts) has
+ * carried it since desktop control landed, so persisting a control lease
+ * failed schema validation on write. */
+const LeasePresetSchema = z.enum([
+  "read-only",
+  "tests-only",
+  "full-write",
+  "image-only",
+  "control",
+]);
+
+const LeaseSchema = z.object({
+  projectId: z.string(),
+  leaseId: z.string(),
+  projectRoot: z.string(),
+  preset: LeasePresetSchema,
+  issuedAt: z.number().int().nonnegative(),
+  expiresAt: z.number().int().nonnegative(),
+});
+
+const ModeSchema = z.enum(["observe", "read", "edit", "verify", "danger"]);
+
+/** Session document shape (active project, mode, lease) — PRD §6, §7.
+ * This is the per-session view every caller still sees; only the on-disk
+ * container around it became a map. */
 const SessionSchema = z.object({
   version: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
   activeProjectId: z.string().nullable(),
-  mode: z.enum(["observe", "read", "edit", "verify", "danger"]),
-  lease: z
-    .object({
-      projectId: z.string(),
-      leaseId: z.string(),
-      projectRoot: z.string(),
-      preset: z.enum(["read-only", "tests-only", "full-write", "image-only"]),
-      issuedAt: z.number().int().nonnegative(),
-      expiresAt: z.number().int().nonnegative(),
-    })
-    .nullable(),
+  mode: ModeSchema,
+  lease: LeaseSchema.nullable(),
 });
 
 export type SessionDocument = z.infer<typeof SessionSchema>;
+
+/** One entry in the v2 session map. */
+const SessionEntrySchema = z.object({
+  activeProjectId: z.string().nullable(),
+  mode: ModeSchema,
+  lease: LeaseSchema.nullable(),
+  slot: z.string(),
+  lastActiveAtMs: z.number().int().nonnegative(),
+});
+
+const SessionDefaultsSchema = z.object({
+  activeProjectId: z.string(),
+  preset: LeasePresetSchema,
+});
+
+/**
+ * v2 sessions.json: a map keyed by MCP session id instead of the single
+ * server-wide document v1 used. v1 kept exactly one `lease`, so two ChatGPT
+ * conversations overwrote each other's project selection.
+ */
+const SessionsFileV2Schema = z.object({
+  version: z.literal(2),
+  updatedAt: z.number().int().nonnegative(),
+  sessions: z.record(z.string(), SessionEntrySchema),
+  defaults: SessionDefaultsSchema.nullable(),
+});
+
+type SessionsFileV2 = z.infer<typeof SessionsFileV2Schema>;
+
+/** v1 shape, still on disk for anyone upgrading in place. */
+const SessionsFileV1Schema = z.object({
+  version: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  activeProjectId: z.string().nullable(),
+  mode: ModeSchema,
+  lease: LeaseSchema.nullable(),
+});
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -74,12 +133,30 @@ function emptyProjectsFile(): ProjectsFile {
 
 function emptySession(): SessionDocument {
   return {
-    version: 1,
+    version: 2,
     updatedAt: Date.now(),
     activeProjectId: null,
     mode: "observe",
     lease: null,
   };
+}
+
+function emptySessionsFile(): SessionsFileV2 {
+  return { version: 2, updatedAt: Date.now(), sessions: {}, defaults: null };
+}
+
+/**
+ * Smallest unused `W##` label. Slots are display names for humans: session
+ * keys are UUIDs, which are unusable in an error message like "held by
+ * another session" or in a dashboard column.
+ */
+function assignSlot(taken: Iterable<string>): string {
+  const used = new Set(taken);
+  for (let i = 1; i <= 999; i += 1) {
+    const candidate = `W${String(i).padStart(2, "0")}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `W${Date.now() % 1000}`;
 }
 
 export class Store {
@@ -158,27 +235,131 @@ export class Store {
     await this.atomicWriteJson(PROJECTS_FILE, doc);
   }
 
-  async getSession(): Promise<SessionDocument> {
+  /**
+   * Read sessions.json, migrating a v1 document forward in memory.
+   *
+   * A v1 file carried one server-wide lease. That lease cannot belong to any
+   * live MCP session (none had connected when it was written), so it is not
+   * resurrected as a session; only its project survives, as the default a new
+   * session inherits. That keeps single-project users on their existing
+   * behaviour while removing the shared lease that made two windows fight.
+   */
+  private async loadSessionsFile(): Promise<{ file: SessionsFileV2; migrated: boolean }> {
     const raw = await this.readJson(SESSIONS_FILE);
-    if (raw === undefined) return emptySession();
-    const parsed = SessionSchema.safeParse(raw);
-    if (!parsed.success) {
-      throw new DomainError(
-        ErrorCode.NOT_IMPLEMENTED,
-        `Store: ${SESSIONS_FILE} failed validation: ${parsed.error.message}`,
-      );
+    if (raw === undefined) return { file: emptySessionsFile(), migrated: false };
+
+    const v2 = SessionsFileV2Schema.safeParse(raw);
+    if (v2.success) return { file: v2.data, migrated: false };
+
+    const v1 = SessionsFileV1Schema.safeParse(raw);
+    if (v1.success) {
+      return {
+        migrated: true,
+        file: {
+          version: 2,
+          updatedAt: Date.now(),
+          sessions: {},
+          defaults: v1.data.activeProjectId
+            ? {
+                activeProjectId: v1.data.activeProjectId,
+                preset: v1.data.lease?.preset ?? "full-write",
+              }
+            : null,
+        },
+      };
     }
-    return parsed.data;
+
+    throw new DomainError(
+      ErrorCode.NOT_IMPLEMENTED,
+      `Store: ${SESSIONS_FILE} failed validation: ${v2.error.message}`,
+    );
   }
 
-  async setSession(s: unknown): Promise<void> {
-    const merged = {
-      ...emptySession(),
-      ...(typeof s === "object" && s !== null ? s : {}),
-    };
-    // updatedAt is always server-recomputed, never trusted from caller input.
-    merged.updatedAt = Date.now();
-    const validated = SessionSchema.parse(merged);
+  private async writeSessionsFile(file: SessionsFileV2): Promise<void> {
+    const validated = SessionsFileV2Schema.parse({ ...file, updatedAt: Date.now() });
     await this.atomicWriteJson(SESSIONS_FILE, validated);
+  }
+
+  /** This session's own lease view. Unknown keys read as an empty session
+   * rather than inheriting whatever another conversation last selected. */
+  async getSession(sessionKey: string = STDIO_SESSION_KEY): Promise<SessionDocument> {
+    const { file } = await this.loadSessionsFile();
+    const entry = file.sessions[sessionKey];
+    if (!entry) return emptySession();
+    return {
+      version: 2,
+      updatedAt: file.updatedAt,
+      activeProjectId: entry.activeProjectId,
+      mode: entry.mode,
+      lease: entry.lease,
+    };
+  }
+
+  async setSession(s: unknown, sessionKey: string = STDIO_SESSION_KEY): Promise<void> {
+    const incoming = typeof s === "object" && s !== null ? (s as Partial<SessionDocument>) : {};
+    const { file } = await this.loadSessionsFile();
+    const existing = file.sessions[sessionKey];
+    const slot =
+      existing?.slot ??
+      assignSlot(Object.values(file.sessions).map((entry) => entry.slot));
+
+    file.sessions[sessionKey] = SessionEntrySchema.parse({
+      activeProjectId: incoming.activeProjectId ?? null,
+      mode: incoming.mode ?? "observe",
+      lease: incoming.lease ?? null,
+      slot,
+      lastActiveAtMs: Date.now(),
+    });
+    await this.writeSessionsFile(file);
+  }
+
+  /** Every persisted session, for cross-session conflict checks. */
+  async listSessions(): Promise<SessionSummary[]> {
+    const { file } = await this.loadSessionsFile();
+    return Object.entries(file.sessions).map(([sessionKey, entry]) => ({
+      sessionKey,
+      slot: entry.slot,
+      activeProjectId: entry.activeProjectId,
+      mode: entry.mode,
+      lease: entry.lease,
+      lastActiveAtMs: entry.lastActiveAtMs,
+    }));
+  }
+
+  async getDefaults(): Promise<SessionDefaults | null> {
+    const { file } = await this.loadSessionsFile();
+    return file.defaults;
+  }
+
+  async setDefaults(d: SessionDefaults | null): Promise<void> {
+    const { file } = await this.loadSessionsFile();
+    file.defaults = d ? SessionDefaultsSchema.parse(d) : null;
+    await this.writeSessionsFile(file);
+  }
+
+  /**
+   * Drop every session not in `liveKeys`, returning the keys removed.
+   *
+   * This is what keeps a closed ChatGPT window from holding a project
+   * hostage: a stale write lease left on disk would otherwise lock the owner
+   * out of their own project until it expired. Pass `null` to clear every
+   * session, which is what a fresh server start does — no transport from a
+   * previous process can still be live.
+   */
+  async sweepSessions(liveKeys: readonly string[] | null): Promise<string[]> {
+    const { file, migrated } = await this.loadSessionsFile();
+    const live = liveKeys === null ? null : new Set(liveKeys);
+    const removed: string[] = [];
+    for (const key of Object.keys(file.sessions)) {
+      if (live === null || !live.has(key)) {
+        removed.push(key);
+        delete file.sessions[key];
+      }
+    }
+    // Persist on migration too, even with nothing to remove: leaving a v1
+    // document on disk means every later read re-derives the same defaults
+    // and the file never reflects the format actually in use.
+    if (removed.length > 0 || migrated) await this.writeSessionsFile(file);
+    return removed;
   }
 }

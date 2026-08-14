@@ -62,6 +62,30 @@ export interface Lease {
 /** Execution mode ladder (PRD §6 / CHATGPT2CODEX-PRD §13). */
 export type ExecutionMode = "observe" | "read" | "edit" | "verify" | "danger";
 
+/** Fixed session key for local stdio callers, which have no transport-level
+ * session id of their own (Codex CLI, the status bar, `serve --stdio`). */
+export const STDIO_SESSION_KEY = "stdio";
+
+/** One persisted MCP session's lease state, as returned by `listSessions`. */
+export interface SessionSummary {
+  sessionKey: string;
+  /** Short human-facing label (`W01`, `W02`, ...). Session keys are UUIDs and
+   * are unreadable in error messages and dashboards. */
+  slot: string;
+  activeProjectId: string | null;
+  mode: ExecutionMode;
+  lease: Lease | null;
+  lastActiveAtMs: number;
+}
+
+/** Project a new session inherits when it has not run project_select yet.
+ * Replaces the old behaviour where `--active-project-root` minted a real
+ * server-wide lease before any client had even connected. */
+export interface SessionDefaults {
+  activeProjectId: string;
+  preset: LeasePreset;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime config
 // ---------------------------------------------------------------------------
@@ -103,13 +127,30 @@ export interface ToolContext {
   ledger: {
     append(event: { type: string; [k: string]: unknown }): Promise<void>;
   };
-  /** Central state store (registry + session persistence). */
+  /** Central state store (registry + session persistence).
+   *
+   * Session reads and writes are keyed: callers pass `ctx.sessionKey` so each
+   * ChatGPT conversation only ever sees its own lease. Omitting the key falls
+   * back to the stdio session, which is what local callers want. */
   store: {
     loadProjects(): Promise<ProjectRegistryEntry[]>;
     saveProjects(p: ProjectRegistryEntry[]): Promise<void>;
-    getSession(): Promise<unknown>;
-    setSession(s: unknown): Promise<void>;
+    getSession(sessionKey?: string): Promise<unknown>;
+    setSession(s: unknown, sessionKey?: string): Promise<void>;
+    /** Every persisted session, used to detect cross-session lease conflicts.
+     * Expired entries are filtered out by the caller, not here. */
+    listSessions?(): Promise<SessionSummary[]>;
+    /** Project a brand-new session inherits when it has not selected one. */
+    getDefaults?(): Promise<SessionDefaults | null>;
+    setDefaults?(d: SessionDefaults | null): Promise<void>;
+    /** Drop every session not listed in `liveKeys` (pass `null` to drop all),
+     * returning the keys removed. Releases leases held by transports that are
+     * gone so a closed conversation cannot keep a project locked. */
+    sweepSessions?(liveKeys: readonly string[] | null): Promise<string[]>;
   };
+  /** Which MCP session this context serves. One ChatGPT conversation maps to
+   * one key; local stdio callers share the fixed `STDIO_SESSION_KEY`. */
+  sessionKey: string;
   config: Config;
   /** True for an MCP server instance handed a remote/network transport
    * session (currently: src/server/http.ts's /mcp endpoint, which is how
@@ -133,6 +174,10 @@ export enum ErrorCode {
   PATH_OUTSIDE_WORKSPACE = "PATH_OUTSIDE_WORKSPACE",
   HASH_MISMATCH = "HASH_MISMATCH",
   LEASE_REQUIRED = "LEASE_REQUIRED",
+  /** Another live MCP session already holds a write lease on this project.
+   * Distinct from PERMISSION_DENIED, which means the caller's own preset is
+   * too weak — here the preset is fine and the project is simply occupied. */
+  PROJECT_LOCKED = "PROJECT_LOCKED",
   COMMAND_NOT_ALLOWED = "COMMAND_NOT_ALLOWED",
   ARBITRARY_SHELL_DENIED = "ARBITRARY_SHELL_DENIED",
   APPROVAL_REQUIRED = "APPROVAL_REQUIRED",
