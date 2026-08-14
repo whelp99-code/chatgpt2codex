@@ -13,5 +13,19 @@ resolve_self() {
 }
 
 ROOT="$(resolve_self)"
-export PATH="$ROOT/bin:$PATH"
-exec "$ROOT/bin/node" "$ROOT/dist/cli.js" "$@"
+
+# Prefer the bundled runtime when the packaged .run shipped one, and fall back
+# to the system Node otherwise. Exec'ing "$ROOT/bin/node" unconditionally broke
+# every install that relies on the distribution's own Node, such as a source
+# checkout or the Ubuntu installer.
+if [ -x "$ROOT/bin/node" ]; then
+  NODE="$ROOT/bin/node"
+  export PATH="$ROOT/bin:$PATH"
+elif command -v node >/dev/null 2>&1; then
+  NODE="$(command -v node)"
+else
+  echo "chatgpt2codex: node not found. Install it with: sudo apt-get install -y nodejs" >&2
+  exit 1
+fi
+
+exec "$NODE" "$ROOT/dist/cli.js" "$@"
