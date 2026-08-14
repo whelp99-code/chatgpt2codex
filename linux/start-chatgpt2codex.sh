@@ -238,9 +238,49 @@ if [ "$DOCTOR" -eq 1 ]; then
   exec "$NODE" "$CLI" doctor
 fi
 
+# Several workspace roots can be registered. They arrive newline-separated in
+# CHATGPT2CODEX_WORKSPACES (a delimiter that cannot appear in a POSIX path,
+# unlike the ':' or ',' a path could legitimately contain) and are forwarded as
+# repeated --workspace flags. WORKSPACE remains the single-root fallback so an
+# older configuration keeps working unchanged.
+WORKSPACES_FILE="${CHATGPT2CODEX_WORKSPACES_FILE:-${XDG_DATA_HOME:-$HOME/.local/share}/chatgpt2codex/workspaces.txt}"
+WORKSPACE_ARGS=()
+
+add_workspace_root() {
+  local root="${1#"${1%%[![:space:]]*}"}"   # trim leading space
+  root="${root%"${root##*[![:space:]]}"}"   # trim trailing space
+  [[ -z "$root" || "$root" == \#* ]] && return 0
+  [[ "$root" == "~/"* ]] && root="$HOME/${root:2}"
+  mkdir -p "$root" 2>/dev/null || true
+  WORKSPACE_ARGS+=(--workspace "$root")
+}
+
+if [[ -n "${CHATGPT2CODEX_WORKSPACES:-}" ]]; then
+  while IFS= read -r workspace_root; do
+    add_workspace_root "$workspace_root"
+  done <<< "$CHATGPT2CODEX_WORKSPACES"
+elif [[ -f "$WORKSPACES_FILE" ]]; then
+  while IFS= read -r workspace_root || [[ -n "$workspace_root" ]]; do
+    add_workspace_root "$workspace_root"
+  done < "$WORKSPACES_FILE"
+fi
+
+if [[ "${#WORKSPACE_ARGS[@]}" -eq 0 ]]; then
+  WORKSPACE_ARGS=(--workspace "$WORKSPACE")
+fi
+echo "[chatgpt2codex] workspace roots ($(( ${#WORKSPACE_ARGS[@]} / 2 ))):"
+for ((wi = 1; wi < ${#WORKSPACE_ARGS[@]}; wi += 2)); do
+  wroot="${WORKSPACE_ARGS[wi]}"
+  if [[ -d "$wroot" && -r "$wroot" ]]; then
+    echo "  - $wroot"
+  else
+    echo "  - $wroot  [UNREADABLE]"
+  fi
+done
+
 doctor_text="$("$NODE" "$CLI" doctor 2>/dev/null || true)"
 if [[ "$doctor_text" != *"owner token configured"* || "${CHATGPT2CODEX_ROTATE_OWNER_TOKEN:-}" == "1" ]]; then
-  init_args=(init --workspace "$WORKSPACE")
+  init_args=(init "${WORKSPACE_ARGS[@]}")
   [ "${CHATGPT2CODEX_ROTATE_OWNER_TOKEN:-}" = "1" ] && init_args+=(--rotate-owner-token)
   echo "[chatgpt2codex] initializing local owner token..."
   "$NODE" "$CLI" "${init_args[@]}"
@@ -280,7 +320,7 @@ fi
 
 echo "[chatgpt2codex] 2/3 starting local HTTP/OAuth MCP server..."
 export CHATGPT2CODEX_AUTO_CAPTURE="${CHATGPT2CODEX_AUTO_CAPTURE:-0}"
-server_args=("$NODE" "$CLI" serve --http --port "$PORT" --public-url "$PUBLIC_URL" --workspace "$WORKSPACE")
+server_args=("$NODE" "$CLI" serve --http --port "$PORT" --public-url "$PUBLIC_URL" "${WORKSPACE_ARGS[@]}")
 if [ -n "${CHATGPT2CODEX_ACTIVE_PROJECT_ROOT:-}" ]; then
   server_args+=(--active-project-root "$CHATGPT2CODEX_ACTIVE_PROJECT_ROOT")
   server_args+=(--active-project-preset "${CHATGPT2CODEX_ACTIVE_PROJECT_PRESET:-full-write}")
