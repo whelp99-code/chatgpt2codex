@@ -86,6 +86,13 @@ function hashAuditValue(value: string): string {
 }
 
 const TRUSTED_CHATGPT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"] as const;
+
+/** Native MCP clients (Codex CLI, desktop apps) register a loopback
+ * redirect_uri per RFC 8252, so the approval form redirects to 127.0.0.1.
+ * form-action is enforced across that redirect, and without these origins the
+ * browser drops the submission with no visible error: the approve button
+ * looks dead. */
+const LOOPBACK_FORM_ACTION_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*"] as const;
 const OWNER_TOKEN_TOGGLE_SCRIPT = `
 (() => {
   const input = document.getElementById("owner_token");
@@ -115,7 +122,7 @@ function securityHeaders(_req: Request, res: Response, next: () => void): void {
       "default-src 'none'",
       "base-uri 'none'",
       "script-src 'self'",
-      `form-action 'self' ${TRUSTED_CHATGPT_ORIGINS.join(" ")}`,
+      `form-action 'self' ${[...TRUSTED_CHATGPT_ORIGINS, ...LOOPBACK_FORM_ACTION_ORIGINS].join(" ")}`,
       `frame-ancestors 'self' ${TRUSTED_CHATGPT_ORIGINS.join(" ")}`,
       "style-src 'unsafe-inline'",
     ].join("; "),
