@@ -369,7 +369,7 @@ describe("Custom GPT action bridge", () => {
       "frame-ancestors 'self' https://chatgpt.com https://chat.openai.com",
     );
     expect(res.headers.get("content-security-policy")).toContain(
-      "form-action 'self' https://chatgpt.com https://chat.openai.com",
+      "form-action 'self' https://chatgpt.com https://chat.openai.com http://127.0.0.1:* http://localhost:*",
     );
     expect(res.headers.get("x-frame-options")).toBeNull();
     expect(text).toContain("Connect ChatGPT To Codex");
