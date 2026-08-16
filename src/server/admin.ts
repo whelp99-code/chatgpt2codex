@@ -20,6 +20,36 @@ const PEERS_FILE = "peers.txt";
 const ADMIN_COOKIE = "c2c_admin";
 const PEER_TIMEOUT_MS = 4000;
 
+/** How long after its last tool call a session still counts as working. A
+ * model calling tools in sequence pauses for seconds; a person reading the
+ * answer before typing again pauses for minutes. 90s sits between the two. */
+const DEFAULT_ACTIVE_WINDOW_MS = 90_000;
+
+/** Refresh cadence for the dashboard. Shorter than the active window so a
+ * session cannot cross from working to quiet without a redraw in between. */
+const DASHBOARD_REFRESH_SECONDS = 30;
+
+export type SessionActivityStatus = "active" | "idle";
+
+/**
+ * Values `localStatus` cannot derive from the store alone.
+ *
+ * `activity` is the important one. The `lastActiveAtMs` persisted in
+ * sessions.json is written by `setSession`, whose only caller is
+ * `project_select` — so a conversation that has spent an hour reading and
+ * editing files still carries the timestamp of its first select. The
+ * transport layer keeps an accurate one per request in memory; passing it in
+ * here is what makes "working" mean working rather than "selected a project
+ * recently". Injected rather than imported so admin does not reach into the
+ * transport layer, and so tests can supply a fixed map.
+ */
+export interface AdminDeps {
+  /** sessionKey -> last activity, epoch ms. */
+  activity?: () => ReadonlyMap<string, number>;
+  activeWindowMs?: number;
+  now?: () => number;
+}
+
 export interface SlotView {
   slot: string;
   projectId: string | null;
@@ -28,6 +58,7 @@ export interface SlotView {
   mode: string;
   expiresAt: number | null;
   lastActiveAtMs: number;
+  status: SessionActivityStatus;
 }
 
 export interface RootView {
@@ -102,15 +133,33 @@ function expandHome(p: string): string {
 }
 
 /** Build this instance's own status. */
-export async function localStatus(ctx: ToolContext, maxSlots: number): Promise<InstanceStatus> {
+export async function localStatus(
+  ctx: ToolContext,
+  maxSlots: number,
+  deps: AdminDeps = {},
+): Promise<InstanceStatus> {
   const projects = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
   const sessions: SessionSummary[] = (await ctx.store.listSessions?.()) ?? [];
-  const now = Date.now();
+  const now = deps.now?.() ?? Date.now();
+  const activeWindowMs = deps.activeWindowMs ?? DEFAULT_ACTIVE_WINDOW_MS;
+
+  // A provider that throws must not take the dashboard down with it; falling
+  // back to the stored timestamps degrades accuracy, not availability.
+  let liveActivity: ReadonlyMap<string, number> | undefined;
+  try {
+    liveActivity = deps.activity?.();
+  } catch {
+    liveActivity = undefined;
+  }
 
   const byId = new Map(projects.map((p) => [p.projectId, p]));
   const slots: SlotView[] = sessions
     .map((session) => {
       const lease = session.lease && session.lease.expiresAt >= now ? session.lease : null;
+      // Sessions the transport layer does not track — stdio callers, or any
+      // session at all right after a restart — fall back to the stored value
+      // and read as idle until their next tool call.
+      const lastActive = liveActivity?.get(session.sessionKey) ?? session.lastActiveAtMs;
       return {
         slot: session.slot,
         projectId: session.activeProjectId,
@@ -121,6 +170,7 @@ export async function localStatus(ctx: ToolContext, maxSlots: number): Promise<I
         mode: session.mode,
         expiresAt: lease?.expiresAt ?? null,
         lastActiveAtMs: session.lastActiveAtMs,
+        status: (now - lastActive < activeWindowMs ? "active" : "idle") as SessionActivityStatus,
       };
     })
     .sort((a, b) => a.slot.localeCompare(b.slot));
@@ -224,7 +274,7 @@ function presentedToken(req: Request): string | undefined {
 export function registerAdminRoutes(
   app: Express,
   ctx: ToolContext,
-  options: { maxSlots: number; secureCookies: boolean },
+  options: { maxSlots: number; secureCookies: boolean } & AdminDeps,
 ): void {
   async function requireOwner(req: Request, res: Response): Promise<boolean> {
     const candidate = presentedToken(req);
@@ -236,7 +286,7 @@ export function registerAdminRoutes(
 
   app.get("/status.json", async (req, res) => {
     if (!(await requireOwner(req, res))) return;
-    res.json(await localStatus(ctx, options.maxSlots));
+    res.json(await localStatus(ctx, options.maxSlots, options));
   });
 
   app.get("/admin", async (req, res) => {
@@ -262,7 +312,7 @@ export function registerAdminRoutes(
 
     const peers = await loadPeers(ctx.stateDir);
     const peerResults = await Promise.all(peers.map((peer) => fetchPeerStatus(peer)));
-    const instances = [await localStatus(ctx, options.maxSlots), ...peerResults];
+    const instances = [await localStatus(ctx, options.maxSlots, options), ...peerResults];
     res.type("html").send(renderDashboard(instances));
   });
 }
@@ -302,6 +352,7 @@ tr:last-child td{border-bottom:0}
 .pill{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid var(--line)}
 .pill.w{color:var(--warn);border-color:#5c4813}
 .pill.r{color:var(--dim)}
+.pill.a{color:var(--ok);border-color:#1f6f34}
 .empty{padding:16px;color:var(--dim);font-size:13px}
 .err{border-color:#5c1e1c}
 .err>h2{color:var(--err)}
@@ -321,16 +372,23 @@ function slotRows(status: InstanceStatus): string {
       const until = slot.expiresAt
         ? new Date(slot.expiresAt).toISOString().slice(11, 16) + " UTC"
         : "—";
+      // Carries the word, not just the colour: the two states have to be
+      // distinguishable without seeing the difference between green and grey.
+      const activity =
+        slot.status === "active"
+          ? `<span class="pill a">진행중</span>`
+          : `<span class="pill r">대기</span>`;
       return `<tr>
         <td class="slot">${esc(slot.slot)}</td>
         <td>${esc(slot.projectName ?? "—")}</td>
+        <td>${activity}</td>
         <td>${preset}</td>
         <td><code>${esc(slot.mode)}</code></td>
         <td><code>${esc(until)}</code></td>
       </tr>`;
     })
     .join("");
-  return `<table><thead><tr><th>슬롯</th><th>프로젝트</th><th>권한</th><th>모드</th><th>만료</th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table><thead><tr><th>슬롯</th><th>프로젝트</th><th>상태</th><th>권한</th><th>모드</th><th>만료</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function instanceCard(status: InstanceStatus | InstanceError): string {
@@ -362,13 +420,17 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
 
 export function renderDashboard(instances: (InstanceStatus | InstanceError)[]): string {
   const generated = new Date().toISOString().slice(0, 19).replace("T", " ");
+  // Refresh through a meta tag rather than a script. The page is served under
+  // `script-src 'self'`, which blocks inline scripts outright — the setTimeout
+  // this replaces never ran once, so the "30초마다 갱신" in the header was a
+  // claim the page could not keep.
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="${DASHBOARD_REFRESH_SECONDS}">
 <title>chatgpt2codex</title><style>${STYLE}</style></head>
 <body>
-<header><h1>chatgpt2codex</h1><span class="sub">${esc(generated)} UTC · 30초마다 갱신</span></header>
+<header><h1>chatgpt2codex</h1><span class="sub">${esc(generated)} UTC · ${DASHBOARD_REFRESH_SECONDS}초마다 갱신</span></header>
 <main>${instances.map(instanceCard).join("")}</main>
-<script>setTimeout(function(){location.reload()},30000)</script>
 </body></html>`;
 }
 
