@@ -296,6 +296,53 @@ describe("renderDashboard", () => {
     expect(html).toContain("timed out");
   });
 
+  // ACCEPT-NAME-001 / ACCEPT-NAME-002
+  it("names a session by its project with the slot alongside", () => {
+    const html = renderDashboard([
+      status({
+        slots: [
+          {
+            slot: "W01",
+            projectId: "webapp",
+            projectName: "chatgpt2codex-repo",
+            preset: "full-write",
+            mode: "edit",
+            expiresAt: Date.now() + 1000,
+            lastActiveAtMs: Date.now(),
+            status: "active",
+          },
+        ],
+      }),
+    ]);
+    expect(html).toContain("chatgpt2codex-repo (W01)");
+    // The project column carried an absolute path nowhere, and merging it into
+    // the label must not start leaking one.
+    expect(html).not.toContain("/Volumes/");
+    expect(html).not.toContain("/home/");
+  });
+
+  it("falls back to the bare slot for a session that has selected nothing", () => {
+    const html = renderDashboard([
+      status({
+        slots: [
+          {
+            slot: "W02",
+            projectId: null,
+            projectName: null,
+            preset: null,
+            mode: "observe",
+            expiresAt: null,
+            lastActiveAtMs: Date.now(),
+            status: "idle",
+          },
+        ],
+      }),
+    ]);
+    expect(html).toContain("(W02)");
+    expect(html).not.toContain("null");
+    expect(html).not.toContain("undefined");
+  });
+
   it("counts only leased slots as active", () => {
     const html = renderDashboard([
       status({

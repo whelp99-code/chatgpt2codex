@@ -376,6 +376,19 @@ tr:last-child td{border-bottom:0}
 code{font-family:ui-monospace,monospace;color:var(--dim);font-size:12px}
 `;
 
+/**
+ * How a session is named in the table: the project it holds, with its slot
+ * kept alongside.
+ *
+ * The slot alone (`W01`) says nothing about what the conversation is doing,
+ * and the project alone cannot separate two windows open on the same one.
+ * Keeping both also preserves the thread to error messages, which cite the
+ * slot when refusing a write — PROJECT_LOCKED names the holder that way.
+ */
+export function sessionLabel(slot: SlotView): string {
+  return slot.projectName ? `${slot.projectName} (${slot.slot})` : `(${slot.slot})`;
+}
+
 function slotRows(status: InstanceStatus): string {
   if (status.slots.length === 0) {
     return `<div class="empty">연결된 세션이 없습니다. ChatGPT 대화창을 열면 여기에 슬롯이 나타납니다.</div>`;
@@ -396,8 +409,7 @@ function slotRows(status: InstanceStatus): string {
           ? `<span class="pill a">진행중</span>`
           : `<span class="pill r">대기</span>`;
       return `<tr>
-        <td class="slot">${esc(slot.slot)}</td>
-        <td>${esc(slot.projectName ?? "—")}</td>
+        <td class="slot">${esc(sessionLabel(slot))}</td>
         <td>${activity}</td>
         <td>${preset}</td>
         <td><code>${esc(slot.mode)}</code></td>
@@ -405,7 +417,7 @@ function slotRows(status: InstanceStatus): string {
       </tr>`;
     })
     .join("");
-  return `<table><thead><tr><th>슬롯</th><th>프로젝트</th><th>상태</th><th>권한</th><th>모드</th><th>만료</th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table><thead><tr><th>세션</th><th>상태</th><th>권한</th><th>모드</th><th>만료</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function instanceCard(status: InstanceStatus | InstanceError): string {
