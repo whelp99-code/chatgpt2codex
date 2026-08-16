@@ -131,6 +131,26 @@ describe("localStatus", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("takes its display name from instance-name.txt", async () => {
+    // The macOS build is started by a GUI app with nowhere to set an env var,
+    // so the file is the only way to label that machine.
+    await writeFile(join(dir, "instance-name.txt"), "mac-studio\n", "utf8");
+    const status = await localStatus(ctx(), 16);
+    expect(status.instance).toBe("mac-studio");
+  });
+
+  it("ignores anything after the first line of instance-name.txt", async () => {
+    await writeFile(join(dir, "instance-name.txt"), "mac-studio\nstray note\n", "utf8");
+    const status = await localStatus(ctx(), 16);
+    expect(status.instance).toBe("mac-studio");
+  });
+
+  it("falls back past an empty instance-name.txt rather than showing a blank card", async () => {
+    await writeFile(join(dir, "instance-name.txt"), "   \n", "utf8");
+    const status = await localStatus(ctx(), 16);
+    expect(status.instance.length).toBeGreaterThan(0);
+  });
+
   it("counts projects per workspace root", async () => {
     const status = await localStatus(ctx(), 16);
     expect(status.workspaceRoots).toEqual([
