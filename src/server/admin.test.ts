@@ -140,6 +140,79 @@ describe("localStatus", () => {
     expect(status.maxSlots).toBe(16);
   });
 
+  // ACCEPT-STAT-003: a session that called a tool moments ago is working; one
+  // that has been quiet past the window is not.
+  it("separates working sessions from quiet ones using the injected activity map", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: lease("webapp", "full-write") },
+      "s1",
+    );
+    await store.setSession(
+      { activeProjectId: "api", mode: "read", lease: lease("api", "read-only") },
+      "s2",
+    );
+
+    const now = 1_800_000_000_000;
+    const status = await localStatus(ctx(), 16, {
+      now: () => now,
+      activeWindowMs: 90_000,
+      activity: () =>
+        new Map([
+          ["s1", now - 5_000],
+          ["s2", now - 600_000],
+        ]),
+    });
+
+    expect(status.slots.map((s) => [s.slot, s.status])).toEqual([
+      ["W01", "active"],
+      ["W02", "idle"],
+    ]);
+
+    const html = renderDashboard([status]);
+    expect(html).toContain("진행중");
+    expect(html).toContain("대기");
+  });
+
+  // ACCEPT-STAT-004: the stored timestamp is the fallback, and it has to be a
+  // fallback rather than a crash — stdio sessions never appear in the map, and
+  // after a restart no session does.
+  it("falls back to the stored timestamp when the activity map lacks the session", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: lease("webapp", "full-write") },
+      "s1",
+    );
+
+    const stored = (await store.listSessions())[0]?.lastActiveAtMs ?? 0;
+    const status = await localStatus(ctx(), 16, {
+      now: () => stored + 10 * 60_000,
+      activeWindowMs: 90_000,
+      activity: () => new Map(),
+    });
+
+    expect(status.slots[0]?.status).toBe("idle");
+  });
+
+  it("keeps serving status when the activity provider throws", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: lease("webapp", "full-write") },
+      "s1",
+    );
+
+    const stored = (await store.listSessions())[0]?.lastActiveAtMs ?? 0;
+    const status = await localStatus(ctx(), 16, {
+      now: () => stored + 10 * 60_000,
+      activeWindowMs: 90_000,
+      activity: () => {
+        throw new Error("transport gone");
+      },
+    });
+
+    // Still answers, and answers from the stored timestamp — the throw is
+    // swallowed rather than propagated to the route handler.
+    expect(status.slots).toHaveLength(1);
+    expect(status.slots[0]?.status).toBe("idle");
+  });
+
   it("lists occupied slots with their project and preset", async () => {
     await store.setSession(
       { activeProjectId: "webapp", mode: "edit", lease: lease("webapp", "full-write") },

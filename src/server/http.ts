@@ -366,6 +366,9 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   registerAdminRoutes(app, ctx, {
     maxSlots: config.maxSessions,
     secureCookies: publicUrl.protocol === "https:",
+    // Snapshot rather than the live map: the dashboard reads activity, it has
+    // no business holding a handle to transport state it could mutate.
+    activity: () => new Map([...sessions].map(([id, tracked]) => [id, tracked.lastActiveAtMs])),
   });
 
   app.get("/privacy", (_req, res) => {
