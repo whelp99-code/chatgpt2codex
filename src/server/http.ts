@@ -61,7 +61,11 @@ export function defaultHttpServerConfig(overrides: Partial<HttpServerConfig> = {
     port: 7979,
     publicUrl: "http://127.0.0.1:7979",
     oauth: {
-      accessTokenTtlSeconds: 3600,
+      // An hour meant a connector left overnight — or over lunch — depended on
+      // a refresh succeeding before it could do anything, which put every
+      // rotation edge case directly in the owner's way. Twelve hours keeps the
+      // credential short-lived while making refresh the exception.
+      accessTokenTtlSeconds: 12 * 3600,
       refreshTokenTtlSeconds: 30 * 24 * 3600,
       scopes: ["chatgpt2codex"],
       allowedRedirectHosts: ["chatgpt.com", "chat.openai.com"],
@@ -309,6 +313,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         reason: event.reason,
         resource: event.resource,
         expiredForSeconds: event.expiredForSeconds,
+        withinGrace: event.withinGrace,
       }),
   };
   const oauthProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, ctx.stateDir);

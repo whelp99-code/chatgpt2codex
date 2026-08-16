@@ -121,6 +121,87 @@ describe("oauth token auditing", () => {
     expect(events[0]?.clientId).toBeUndefined();
   });
 
+  it("answers a client's parallel refreshes instead of locking it out", async () => {
+    // The incident this exists for: one connector fired six refreshes inside a
+    // second, the first rotated the token away, and the other five were told
+    // their credentials were invalid.
+    const { JsonOAuthStore, hashToken } = await import("./oauth-store.js");
+    const store = new JsonOAuthStore(dir);
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    await store.saveTokenPair({
+      accessTokenHash: hashToken("a0"),
+      accessToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+      refreshTokenHash: hashToken("r0"),
+      refreshToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+    });
+
+    const first = await provider.exchangeRefreshToken(client(), "r0", undefined, RESOURCE);
+    expect(first.access_token).toBeTruthy();
+
+    // Same now-rotated token again, as a retry in flight would carry.
+    const replay = await provider.exchangeRefreshToken(client(), "r0", undefined, RESOURCE);
+    expect(replay.access_token).toBeTruthy();
+    expect(replay.access_token).not.toBe(first.access_token);
+
+    const grace = events.filter((e) => e.outcome === "granted" && e.withinGrace);
+    expect(grace).toHaveLength(1);
+    expect(grace[0]?.clientId).toBe("client-1");
+  });
+
+  it("refuses a replay once the grace window has closed", async () => {
+    provider = makeProvider({ refreshRotationGraceSeconds: 0 });
+    const { JsonOAuthStore, hashToken } = await import("./oauth-store.js");
+    const store = new JsonOAuthStore(dir);
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    await store.saveTokenPair({
+      accessTokenHash: hashToken("a1"),
+      accessToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+      refreshTokenHash: hashToken("r1"),
+      refreshToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+    });
+
+    await provider.exchangeRefreshToken(client(), "r1", undefined, RESOURCE);
+    // With no grace, rotation stays strictly one-time — the property that makes
+    // a replayed token detectable at all.
+    await expect(provider.exchangeRefreshToken(client(), "r1", undefined, RESOURCE)).rejects.toThrow();
+  });
+
+  it("does not let one client spend another's token inside the grace window", async () => {
+    const { JsonOAuthStore, hashToken } = await import("./oauth-store.js");
+    const store = new JsonOAuthStore(dir);
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    await store.saveTokenPair({
+      accessTokenHash: hashToken("a2"),
+      accessToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+      refreshTokenHash: hashToken("r2"),
+      refreshToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+    });
+    await provider.exchangeRefreshToken(client(), "r2", undefined, RESOURCE);
+
+    await expect(
+      provider.exchangeRefreshToken(client("client-2"), "r2", undefined, RESOURCE),
+    ).rejects.toThrow();
+    expect(events.some((e) => e.clientId === "client-2" && e.outcome === "rejected")).toBe(true);
+  });
+
+  it("supersedes a client's previous access token when it refreshes", async () => {
+    const { JsonOAuthStore, hashToken } = await import("./oauth-store.js");
+    const store = new JsonOAuthStore(dir);
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    await store.saveTokenPair({
+      accessTokenHash: hashToken("a3"),
+      accessToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+      refreshTokenHash: hashToken("r3"),
+      refreshToken: { clientId: "client-1", scopes: ["chatgpt2codex"], expiresAt: soon, resource: RESOURCE.href },
+    });
+
+    await provider.exchangeRefreshToken(client(), "r3", undefined, RESOURCE);
+
+    // The replaced credential must stop working immediately, not linger for
+    // the rest of its TTL.
+    await expect(provider.verifyAccessToken("a3")).rejects.toThrow();
+  });
+
   it("keeps rejecting normally when the audit sink throws", async () => {
     provider = makeProvider({
       onTokenEvent: () => {

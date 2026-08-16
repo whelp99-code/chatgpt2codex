@@ -72,18 +72,56 @@ const RefreshTokenSchema = z.object({
   resource: z.string().optional(),
 });
 
+/**
+ * A refresh token that has been rotated away, kept briefly so a client that
+ * fired several refreshes at once is not locked out by its own concurrency.
+ *
+ * Rotation is one-time, which is correct: a replayed refresh token is how
+ * theft shows up. But clients retry, and they retry in parallel — six
+ * requests inside a second, from one connector, were what put this here. The
+ * first rotates the token away and the rest arrive holding a value the server
+ * has already deleted. Every one of them is refused, the client concludes its
+ * credentials are dead, and the owner is told to reconnect. Nothing was
+ * stolen; the client merely asked twice.
+ */
+const ConsumedRefreshTokenSchema = z.object({
+  tokenHash: z.string(),
+  clientId: z.string(),
+  scopes: z.array(z.string()),
+  resource: z.string().optional(),
+  /** Epoch seconds. Replays are honoured until this passes, refused after. */
+  graceUntil: z.number(),
+});
+
 const OAuthFileSchema = z.object({
   version: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
   clients: z.array(ClientSchema),
   accessTokens: z.array(AccessTokenSchema),
   refreshTokens: z.array(RefreshTokenSchema),
+  // Absent in files written before rotation grace existed; those load as an
+  // empty list rather than failing validation and wiping every registration.
+  consumedRefreshTokens: z.array(ConsumedRefreshTokenSchema).default([]),
 });
 
 type OAuthFile = z.infer<typeof OAuthFileSchema>;
 
+export interface ConsumedRefreshTokenRecord {
+  clientId: string;
+  scopes: string[];
+  resource?: string;
+  graceUntil: number;
+}
+
 function emptyFile(): OAuthFile {
-  return { version: 1, updatedAt: Date.now(), clients: [], accessTokens: [], refreshTokens: [] };
+  return {
+    version: 1,
+    updatedAt: Date.now(),
+    clients: [],
+    accessTokens: [],
+    refreshTokens: [],
+    consumedRefreshTokens: [],
+  };
 }
 
 export function hashToken(token: string): string {
@@ -164,6 +202,22 @@ export class JsonOAuthStore {
   private sweepExpired(doc: OAuthFile, nowSeconds: number): void {
     doc.accessTokens = doc.accessTokens.filter((t) => t.expiresAt >= nowSeconds);
     doc.refreshTokens = doc.refreshTokens.filter((t) => t.expiresAt >= nowSeconds);
+    doc.consumedRefreshTokens = doc.consumedRefreshTokens.filter((t) => t.graceUntil >= nowSeconds);
+  }
+
+  /**
+   * A rotated-away refresh token, if it is still inside its grace window.
+   * Past the window it is gone and the caller sees an unknown token, which is
+   * the answer a genuine replay deserves.
+   */
+  async getConsumedRefreshToken(tokenHash: string): Promise<ConsumedRefreshTokenRecord | undefined> {
+    return this.locked(async () => {
+      const doc = await this.load();
+      const found = doc.consumedRefreshTokens.find((t) => t.tokenHash === tokenHash);
+      return found
+        ? { clientId: found.clientId, scopes: found.scopes, resource: found.resource, graceUntil: found.graceUntil }
+        : undefined;
+    });
   }
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
@@ -239,8 +293,16 @@ export class JsonOAuthStore {
    * consuming (one-time-rotating) a prior refresh token hash. Returns false
    * (and persists nothing) if `consumedRefreshTokenHash` was provided but not
    * found — signals a replayed/already-rotated refresh token to the caller.
+   *
+   * A consumed token is moved to `consumedRefreshTokens` for `graceSeconds`
+   * rather than dropped, so a client's own parallel retries can still be
+   * answered. It is never accepted from `refreshTokens` again either way.
    */
-  async saveTokenPair(pair: PersistedTokenPair, consumedRefreshTokenHash?: string): Promise<boolean> {
+  async saveTokenPair(
+    pair: PersistedTokenPair,
+    consumedRefreshTokenHash?: string,
+    graceSeconds = 0,
+  ): Promise<boolean> {
     return this.locked(async () => {
       const doc = await this.load();
       const now = Math.floor(Date.now() / 1000);
@@ -249,10 +311,27 @@ export class JsonOAuthStore {
       if (consumedRefreshTokenHash) {
         const idx = doc.refreshTokens.findIndex((t) => t.tokenHash === consumedRefreshTokenHash);
         if (idx === -1) return false;
-        doc.refreshTokens.splice(idx, 1);
+        const [consumed] = doc.refreshTokens.splice(idx, 1);
+        if (consumed && graceSeconds > 0) {
+          doc.consumedRefreshTokens = doc.consumedRefreshTokens.filter(
+            (t) => t.tokenHash !== consumed.tokenHash,
+          );
+          doc.consumedRefreshTokens.push({
+            tokenHash: consumed.tokenHash,
+            clientId: consumed.clientId,
+            scopes: consumed.scopes,
+            resource: consumed.resource,
+            graceUntil: now + graceSeconds,
+          });
+        }
       }
 
-      doc.accessTokens = doc.accessTokens.filter((t) => t.tokenHash !== pair.accessTokenHash);
+      // Supersede this client's earlier access tokens. Leaving them behind let
+      // a connector accumulate one live credential per refresh, each valid for
+      // the full TTL after it had already been replaced.
+      doc.accessTokens = doc.accessTokens.filter(
+        (t) => t.tokenHash !== pair.accessTokenHash && t.clientId !== pair.accessToken.clientId,
+      );
       doc.accessTokens.push({ tokenHash: pair.accessTokenHash, ...pair.accessToken });
       doc.refreshTokens = doc.refreshTokens.filter((t) => t.tokenHash !== pair.refreshTokenHash);
       doc.refreshTokens.push({ tokenHash: pair.refreshTokenHash, ...pair.refreshToken });
