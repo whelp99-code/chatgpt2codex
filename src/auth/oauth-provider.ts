@@ -1101,19 +1101,48 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       throw new AccessDeniedError("Refresh token cannot grant requested scopes");
     }
 
-    const tokens = await this.issueTokens(
-      client.client_id,
-      requestedScopes,
-      resource ?? (record.resource ? new URL(record.resource) : undefined),
-      refreshTokenHash,
-    );
-    this.auditToken({
-      grant: "refresh_token",
-      outcome: "granted",
-      clientId: client.client_id,
-      resource: resource?.href ?? record.resource,
-    });
-    return tokens;
+    const effectiveResource = resource ?? (record.resource ? new URL(record.resource) : undefined);
+    try {
+      const tokens = await this.issueTokens(
+        client.client_id,
+        requestedScopes,
+        effectiveResource,
+        refreshTokenHash,
+      );
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "granted",
+        clientId: client.client_id,
+        resource: resource?.href ?? record.resource,
+      });
+      return tokens;
+    } catch (err) {
+      // The token was present when this request read it and gone by the time
+      // it tried to spend it: a sibling retry rotated it in between. Reads
+      // cannot be held under the write lock without serialising every refresh
+      // on the server, so the race is closed here instead — the same grace
+      // that covers a replay covers losing this footrace.
+      const consumed = await this.oauthStore.getConsumedRefreshToken(refreshTokenHash);
+      if (consumed && consumed.clientId === client.client_id && consumed.graceUntil >= Math.floor(Date.now() / 1000)) {
+        const tokens = await this.issueTokens(client.client_id, requestedScopes, effectiveResource);
+        this.auditToken({
+          grant: "refresh_token",
+          outcome: "granted",
+          withinGrace: true,
+          clientId: client.client_id,
+          resource: resource?.href ?? record.resource,
+        });
+        return tokens;
+      }
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reason: "refresh_replayed",
+        resource: resource?.href ?? record.resource,
+      });
+      throw err;
+    }
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
