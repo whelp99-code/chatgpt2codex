@@ -289,6 +289,20 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         clientIdHash: hashAuditValue(event.clientId),
         hasClientName: event.clientName !== undefined,
       }),
+    // client_id is recorded in the clear here, unlike the owner-token attempt
+    // above. That one logs failures from unauthenticated callers, where the id
+    // is attacker-supplied; these are grants against registered clients, and
+    // the id is already sitting in oauth.json — hashing it would only stop the
+    // owner from matching a rejection to the connector that caused it.
+    onTokenEvent: (event) =>
+      ctx.ledger.append({
+        type: `oauth.token.${event.outcome}`,
+        grant: event.grant,
+        clientId: event.clientId,
+        reason: event.reason,
+        resource: event.resource,
+        expiredForSeconds: event.expiredForSeconds,
+      }),
   };
   const oauthProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, ctx.stateDir);
   const oauthMetadata = createOAuthMetadata({

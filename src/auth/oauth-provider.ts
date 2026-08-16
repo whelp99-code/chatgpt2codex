@@ -44,6 +44,39 @@ export interface OAuthConfig {
     clientId: string;
     clientName?: string;
   }) => Promise<void> | void;
+  /**
+   * Every token grant and every rejection, successful or not.
+   *
+   * Without this a connector that stops working leaves no trace at all: the
+   * owner sees "reconnect" in ChatGPT while the server looks perfectly
+   * healthy, and there is no way to tell a client that never attempted a
+   * refresh from one whose refresh was rejected — or why. The absence of
+   * `refresh` events for a client is itself the finding.
+   */
+  onTokenEvent?: (event: TokenAuditEvent) => Promise<void> | void;
+}
+
+/** Why a grant was refused. Named causes rather than free text so the log can
+ * be counted and compared across incidents. */
+export type TokenRejectionReason =
+  | "unknown_refresh_token"
+  | "client_mismatch"
+  | "refresh_expired"
+  | "resource_mismatch"
+  | "scope_escalation"
+  | "unknown_access_token"
+  | "access_expired";
+
+export interface TokenAuditEvent {
+  grant: "authorization_code" | "refresh_token" | "access_verify";
+  outcome: "granted" | "rejected";
+  clientId?: string;
+  reason?: TokenRejectionReason;
+  /** Requested resource, when the client sent one. Public connector URL, not a secret. */
+  resource?: string;
+  /** How long the presented credential had been expired, in seconds. Tells a
+   * client that never refreshed from one that refreshed late. */
+  expiredForSeconds?: number;
 }
 
 interface AuthorizationCodeRecord {
@@ -927,7 +960,28 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     this.codes.delete(authorizationCode);
-    return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
+    const tokens = await this.issueTokens(
+      client.client_id,
+      record.params.scopes ?? this.config.scopes,
+      record.params.resource,
+    );
+    this.auditToken({
+      grant: "authorization_code",
+      outcome: "granted",
+      clientId: client.client_id,
+      resource: record.params.resource?.href,
+    });
+    return tokens;
+  }
+
+  /** Audit must never change the OAuth outcome, so failures here are dropped
+   * the same way the owner-token attempt logging drops them. */
+  private auditToken(event: TokenAuditEvent): void {
+    try {
+      void Promise.resolve(this.config.onTokenEvent?.(event)).catch(() => undefined);
+    } catch {
+      // Ignored on purpose.
+    }
   }
 
   async exchangeRefreshToken(
@@ -936,31 +990,98 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
     resource?: URL,
   ): Promise<OAuthTokens> {
+    const now = Math.floor(Date.now() / 1000);
     const refreshTokenHash = hashToken(refreshToken);
     const record = await this.oauthStore.getRefreshToken(refreshTokenHash);
-    if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
+
+    // Each rejection is reported under its own cause. The client is told
+    // "Invalid refresh token" either way — telling it apart is exactly what
+    // the owner needs and exactly what an attacker must not learn.
+    if (!record) {
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reason: "unknown_refresh_token",
+        resource: resource?.href,
+      });
+      throw new InvalidGrantError("Invalid refresh token");
+    }
+    if (record.clientId !== client.client_id) {
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reason: "client_mismatch",
+        resource: resource?.href,
+      });
+      throw new InvalidGrantError("Invalid refresh token");
+    }
+    if (record.expiresAt < now) {
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reason: "refresh_expired",
+        resource: resource?.href,
+        expiredForSeconds: now - record.expiresAt,
+      });
       throw new InvalidGrantError("Invalid refresh token");
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reason: "resource_mismatch",
+        resource: resource.href,
+      });
       throw new InvalidGrantError("Invalid resource");
     }
 
     const requestedScopes = scopes ?? record.scopes;
     if (!requestedScopes.every((scope) => record.scopes.includes(scope))) {
+      this.auditToken({
+        grant: "refresh_token",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reason: "scope_escalation",
+        resource: resource?.href,
+      });
       throw new AccessDeniedError("Refresh token cannot grant requested scopes");
     }
 
-    return this.issueTokens(
+    const tokens = await this.issueTokens(
       client.client_id,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
       refreshTokenHash,
     );
+    this.auditToken({
+      grant: "refresh_token",
+      outcome: "granted",
+      clientId: client.client_id,
+      resource: resource?.href ?? record.resource,
+    });
+    return tokens;
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
+    const now = Math.floor(Date.now() / 1000);
     const record = await this.oauthStore.getAccessToken(hashToken(token));
-    if (!record || record.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (!record) {
+      this.auditToken({ grant: "access_verify", outcome: "rejected", reason: "unknown_access_token" });
+      throw new InvalidTokenError("Invalid or expired access token");
+    }
+    if (record.expiresAt < now) {
+      this.auditToken({
+        grant: "access_verify",
+        outcome: "rejected",
+        clientId: record.clientId,
+        reason: "access_expired",
+        resource: record.resource,
+        expiredForSeconds: now - record.expiresAt,
+      });
       throw new InvalidTokenError("Invalid or expired access token");
     }
 

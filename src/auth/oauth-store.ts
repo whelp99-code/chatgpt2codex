@@ -202,11 +202,20 @@ export class JsonOAuthStore {
     });
   }
 
+  /**
+   * Returns the record whether or not it has expired; the caller decides.
+   *
+   * Filtering expired tokens out here made the two failures indistinguishable:
+   * a token that lapsed an hour ago and one that was never issued both came
+   * back as `undefined`. During an incident that is the single most useful
+   * distinction there is — it separates a client that stopped refreshing from
+   * one presenting garbage — so expiry is judged one level up, where the
+   * reason can be recorded. Both callers already compare `expiresAt`, so
+   * nothing expired is ever accepted.
+   */
   async getAccessToken(tokenHash: string): Promise<PersistedAccessTokenRecord | undefined> {
     return this.locked(async () => {
       const doc = await this.load();
-      const now = Math.floor(Date.now() / 1000);
-      this.sweepExpired(doc, now);
       const found = doc.accessTokens.find((t) => t.tokenHash === tokenHash);
       return found
         ? { clientId: found.clientId, scopes: found.scopes, expiresAt: found.expiresAt, resource: found.resource }
@@ -214,11 +223,10 @@ export class JsonOAuthStore {
     });
   }
 
+  /** Expiry is judged by the caller — see `getAccessToken` for why. */
   async getRefreshToken(tokenHash: string): Promise<PersistedRefreshTokenRecord | undefined> {
     return this.locked(async () => {
       const doc = await this.load();
-      const now = Math.floor(Date.now() / 1000);
-      this.sweepExpired(doc, now);
       const found = doc.refreshTokens.find((t) => t.tokenHash === tokenHash);
       return found
         ? { clientId: found.clientId, scopes: found.scopes, expiresAt: found.expiresAt, resource: found.resource }
