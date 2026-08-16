@@ -25,6 +25,10 @@ const PEER_TIMEOUT_MS = 4000;
  * answer before typing again pauses for minutes. 90s sits between the two. */
 const DEFAULT_ACTIVE_WINDOW_MS = 90_000;
 
+/** Refresh cadence for the dashboard. Shorter than the active window so a
+ * session cannot cross from working to quiet without a redraw in between. */
+const DASHBOARD_REFRESH_SECONDS = 30;
+
 export type SessionActivityStatus = "active" | "idle";
 
 /**
@@ -416,13 +420,17 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
 
 export function renderDashboard(instances: (InstanceStatus | InstanceError)[]): string {
   const generated = new Date().toISOString().slice(0, 19).replace("T", " ");
+  // Refresh through a meta tag rather than a script. The page is served under
+  // `script-src 'self'`, which blocks inline scripts outright — the setTimeout
+  // this replaces never ran once, so the "30초마다 갱신" in the header was a
+  // claim the page could not keep.
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="${DASHBOARD_REFRESH_SECONDS}">
 <title>chatgpt2codex</title><style>${STYLE}</style></head>
 <body>
-<header><h1>chatgpt2codex</h1><span class="sub">${esc(generated)} UTC · 30초마다 갱신</span></header>
+<header><h1>chatgpt2codex</h1><span class="sub">${esc(generated)} UTC · ${DASHBOARD_REFRESH_SECONDS}초마다 갱신</span></header>
 <main>${instances.map(instanceCard).join("")}</main>
-<script>setTimeout(function(){location.reload()},30000)</script>
 </body></html>`;
 }
 
