@@ -54,7 +54,19 @@ export interface OAuthConfig {
    * `refresh` events for a client is itself the finding.
    */
   onTokenEvent?: (event: TokenAuditEvent) => Promise<void> | void;
+  /**
+   * How long a rotated-away refresh token keeps working, in seconds.
+   *
+   * Covers a client's own concurrent retries and nothing more. Long enough
+   * and a stolen token stays usable; zero and honest clients lock themselves
+   * out by retrying. Seconds, not minutes.
+   */
+  refreshRotationGraceSeconds?: number;
 }
+
+/** Comfortably longer than a burst of parallel retries, far shorter than
+ * anything an attacker could work with. */
+const DEFAULT_REFRESH_ROTATION_GRACE_SECONDS = 30;
 
 /** Why a grant was refused. Named causes rather than free text so the log can
  * be counted and compared across incidents. */
@@ -65,11 +77,17 @@ export type TokenRejectionReason =
   | "resource_mismatch"
   | "scope_escalation"
   | "unknown_access_token"
-  | "access_expired";
+  | "access_expired"
+  /** Replayed after its grace window closed — the case rotation exists to catch. */
+  | "refresh_replayed";
 
 export interface TokenAuditEvent {
   grant: "authorization_code" | "refresh_token" | "access_verify";
   outcome: "granted" | "rejected";
+  /** Set when the grant came from a token already rotated away, inside grace.
+   * Frequent enough to be worth counting: it means the client is refreshing
+   * concurrently, not that anything is wrong. */
+  withinGrace?: boolean;
   clientId?: string;
   reason?: TokenRejectionReason;
   /** Requested resource, when the client sent one. Public connector URL, not a secret. */
@@ -998,11 +1016,43 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     // "Invalid refresh token" either way — telling it apart is exactly what
     // the owner needs and exactly what an attacker must not learn.
     if (!record) {
+      // Before calling it unknown, check whether this is the client's own
+      // token from moments ago. Clients refresh in parallel; the first request
+      // rotates the token away and the rest must not be punished for it.
+      const consumed = await this.oauthStore.getConsumedRefreshToken(refreshTokenHash);
+      if (consumed && consumed.clientId === client.client_id && consumed.graceUntil >= now) {
+        if (
+          resource &&
+          !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })
+        ) {
+          this.auditToken({
+            grant: "refresh_token",
+            outcome: "rejected",
+            clientId: client.client_id,
+            reason: "resource_mismatch",
+            resource: resource.href,
+          });
+          throw new InvalidGrantError("Invalid resource");
+        }
+        const graceTokens = await this.issueTokens(
+          client.client_id,
+          scopes ?? consumed.scopes,
+          resource ?? (consumed.resource ? new URL(consumed.resource) : undefined),
+        );
+        this.auditToken({
+          grant: "refresh_token",
+          outcome: "granted",
+          withinGrace: true,
+          clientId: client.client_id,
+          resource: resource?.href ?? consumed.resource,
+        });
+        return graceTokens;
+      }
       this.auditToken({
         grant: "refresh_token",
         outcome: "rejected",
         clientId: client.client_id,
-        reason: "unknown_refresh_token",
+        reason: consumed ? "refresh_replayed" : "unknown_refresh_token",
         resource: resource?.href,
       });
       throw new InvalidGrantError("Invalid refresh token");
@@ -1185,6 +1235,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         },
       },
       consumedRefreshTokenHash,
+      this.config.refreshRotationGraceSeconds ?? DEFAULT_REFRESH_ROTATION_GRACE_SECONDS,
     );
     if (!saved) {
       throw new InvalidGrantError("Invalid refresh token");
