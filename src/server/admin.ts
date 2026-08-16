@@ -1,5 +1,6 @@
 import { hostname, platform } from "node:os";
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Express, Request, Response } from "express";
 import type { SessionSummary, ToolContext } from "../types.js";
@@ -19,6 +20,7 @@ import { verifyOwnerToken } from "../auth/owner-token.js";
 const PEERS_FILE = "peers.txt";
 const ADMIN_COOKIE = "c2c_admin";
 const PEER_TIMEOUT_MS = 4000;
+const INSTANCE_NAME_FILE = "instance-name.txt";
 
 /** How long after its last tool call a session still counts as working. A
  * model calling tools in sequence pauses for seconds; a person reading the
@@ -90,10 +92,25 @@ export interface Peer {
   tokenPath: string;
 }
 
-/** Name shown for this server in the dashboard and in MCP handshakes. Two
- * machines otherwise expose identically named tools, so the label is what
- * tells "the Mac's webapp" from "the Ubuntu box's webapp". */
-export function instanceName(): string {
+/**
+ * Name shown for this server in the dashboard. Two machines otherwise expose
+ * identically named tools and identically shaped project lists, so the label
+ * is the only thing telling "the Mac" from "the Ubuntu box".
+ *
+ * The file is checked before the environment because the macOS build is
+ * launched by a GUI app, which has no convenient place to set a variable. A
+ * file in the state dir is edited the same way on both platforms; the env var
+ * stays for systemd units, which set one naturally.
+ */
+export function instanceName(stateDir?: string): string {
+  if (stateDir) {
+    try {
+      const fromFile = readFileSync(join(stateDir, INSTANCE_NAME_FILE), "utf8").trim();
+      if (fromFile.length > 0) return fromFile.split("\n")[0]!.trim();
+    } catch {
+      // Not configured; fall through to the environment and then the hostname.
+    }
+  }
   const configured = process.env.CHATGPT2CODEX_INSTANCE_NAME?.trim();
   return configured && configured.length > 0 ? configured : hostname();
 }
@@ -181,7 +198,7 @@ export async function localStatus(
   }));
 
   return {
-    instance: instanceName(),
+    instance: instanceName(ctx.stateDir),
     ok: true,
     platform: platform(),
     workspaceRoots,
