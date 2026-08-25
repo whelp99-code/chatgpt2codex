@@ -150,6 +150,13 @@ export interface ToolContext {
     /** Release one session's lease, keeping the session itself. Returns false
      * when the session is unknown or already holds nothing. */
     releaseSessionLease?(sessionKey: string): Promise<boolean>;
+    /** Move a live same-connector lease onto `sessionKey` in one write.
+     * Returns undefined when no sibling holds an unexpired lease on `projectId`. */
+    adoptConnectorLease?(
+      sessionKey: string,
+      clientId: string,
+      projectId: string,
+    ): Promise<{ lease: Lease; fromSlot: string; mode: ExecutionMode } | undefined>;
     /** Drop every session not listed in `liveKeys` (pass `null` to drop all),
      * returning the keys removed. Releases leases held by transports that are
      * gone so a closed conversation cannot keep a project locked. */

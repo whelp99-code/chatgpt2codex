@@ -179,6 +179,9 @@ async function buildToolContext(workspaceRoots: string[], persistRegistry = true
       listSessions: () => store.listSessions(),
       getDefaults: () => store.getDefaults(),
       setDefaults: (d) => store.setDefaults(d),
+      releaseSessionLease: (sessionKey) => store.releaseSessionLease(sessionKey),
+      adoptConnectorLease: (sessionKey, clientId, projectId) =>
+        store.adoptConnectorLease(sessionKey, clientId, projectId),
       sweepSessions: (liveKeys) => store.sweepSessions(liveKeys),
     },
     config,

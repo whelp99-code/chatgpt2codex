@@ -35,13 +35,14 @@ describe("requireProjectLease across sessions", () => {
     aliases: ["api"],
   };
 
-  function ctxFor(sessionKey: string): ToolContext {
+  function ctxFor(sessionKey: string, clientId?: string): ToolContext {
     return {
       workspaceRoot: "/w",
       workspaceRoots: ["/w"],
       stateDir: dir,
       registry: [webapp, api],
       ledger: { append: async () => undefined },
+      clientId,
       store: {
         loadProjects: () => store.loadProjects(),
         saveProjects: (p) => store.saveProjects(p),
@@ -50,6 +51,8 @@ describe("requireProjectLease across sessions", () => {
         listSessions: () => store.listSessions(),
         getDefaults: () => store.getDefaults(),
         setDefaults: (d) => store.setDefaults(d),
+        releaseSessionLease: (key) => store.releaseSessionLease(key),
+        adoptConnectorLease: (key, id, projectId) => store.adoptConnectorLease(key, id, projectId),
         sweepSessions: (keys) => store.sweepSessions(keys),
       },
       config: {
@@ -161,6 +164,51 @@ describe("requireProjectLease across sessions", () => {
     await select("stdio", webapp, "full-write");
     const ctx = ctxFor("stdio");
     await expect(requireProjectLease(ctx, "webapp", "write")).resolves.toBeTruthy();
+  });
+
+  it("moves a same-connector sibling lease rather than copying it", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: makeLease(webapp, "full-write"), clientId: "client-A" },
+      "older",
+    );
+
+    await expect(requireProjectLease(ctxFor("newer", "client-A"), "webapp", "write")).resolves.toBeTruthy();
+
+    const sessions = await store.listSessions();
+    expect(sessions.find((s) => s.sessionKey === "older")?.lease).toBeNull();
+    expect(sessions.find((s) => s.sessionKey === "newer")?.lease?.projectId).toBe("webapp");
+  });
+
+  it("does not move a sibling lease when the requested capability is not allowed", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: makeLease(webapp, "read-only"), clientId: "client-A" },
+      "older",
+    );
+
+    await expect(requireProjectLease(ctxFor("newer", "client-A"), "webapp", "write")).rejects.toMatchObject({
+      code: ErrorCode.PERMISSION_DENIED,
+    });
+
+    const older = (await store.listSessions()).find((s) => s.sessionKey === "older");
+    expect(older?.lease?.preset).toBe("read-only");
+    expect((await store.listSessions()).find((s) => s.sessionKey === "newer")).toBeUndefined();
+  });
+
+  it("leaves a single holder when two sessions adopt at once", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: makeLease(webapp, "full-write"), clientId: "client-A" },
+      "older",
+    );
+
+    await Promise.all([
+      requireProjectLease(ctxFor("a", "client-A"), "webapp", "write"),
+      requireProjectLease(ctxFor("b", "client-A"), "webapp", "write"),
+    ]);
+
+    const holders = (await store.listSessions()).filter((s) => s.lease?.projectId === "webapp");
+    expect(holders).toHaveLength(1);
+    expect(["a", "b"]).toContain(holders[0]?.sessionKey);
+    expect((await store.listSessions()).find((s) => s.sessionKey === "older")?.lease).toBeNull();
   });
 });
 
@@ -280,5 +328,63 @@ describe("lease follows the connector, not the session id", () => {
     ];
     const ctx = ctxWith(sessions, "newer", "client-A");
     await expect(requireProjectLease(ctx, "webapp", "read")).rejects.toThrow();
+  });
+
+  it("does not move a sibling lease when the preset forbids the capability", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "older",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "read",
+        lease: lease("webapp", "read-only"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    let released: string | undefined;
+    let setKey: string | undefined;
+    const ctx = ctxWith(
+      sessions,
+      "newer",
+      "client-A",
+      (_s, key) => {
+        setKey = key;
+      },
+      (k) => {
+        released = k;
+      },
+    );
+
+    await expect(requireProjectLease(ctx, "webapp", "write")).rejects.toMatchObject({
+      code: ErrorCode.PERMISSION_DENIED,
+    });
+    expect(released).toBeUndefined();
+    expect(setKey).toBeUndefined();
+  });
+
+  it("does not copy a sibling lease when the store cannot release it", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "older",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    let setKey: string | undefined;
+    const ctx = ctxWith(sessions, "newer", "client-A", (_s, key) => {
+      setKey = key;
+    });
+    delete ctx.store.releaseSessionLease;
+    delete ctx.store.adoptConnectorLease;
+
+    await expect(requireProjectLease(ctx, "webapp", "write")).rejects.toMatchObject({
+      code: ErrorCode.LEASE_REQUIRED,
+    });
+    expect(setKey).toBeUndefined();
   });
 });

@@ -170,4 +170,38 @@ describe("Store session map (v2)", () => {
     expect(raw.version).toBe(2);
     expect(Object.keys(raw.sessions)).toEqual(["s1"]);
   });
+
+  it("adoptConnectorLease moves a sibling lease in one write", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: lease("webapp"), clientId: "client-A" },
+      "older",
+    );
+
+    const moved = await store.adoptConnectorLease("newer", "client-A", "webapp");
+    expect(moved?.lease.projectId).toBe("webapp");
+    expect(moved?.fromSlot).toBe("W01");
+    expect(moved?.mode).toBe("edit");
+
+    const sessions = await store.listSessions();
+    expect(sessions.find((s) => s.sessionKey === "older")?.lease).toBeNull();
+    expect(sessions.find((s) => s.sessionKey === "newer")?.lease?.projectId).toBe("webapp");
+    expect(sessions.find((s) => s.sessionKey === "newer")?.clientId).toBe("client-A");
+  });
+
+  it("adoptConnectorLease leaves one holder when two adopters race", async () => {
+    await store.setSession(
+      { activeProjectId: "webapp", mode: "edit", lease: lease("webapp"), clientId: "client-A" },
+      "older",
+    );
+
+    await Promise.all([
+      store.adoptConnectorLease("a", "client-A", "webapp"),
+      store.adoptConnectorLease("b", "client-A", "webapp"),
+    ]);
+
+    const holders = (await store.listSessions()).filter((s) => s.lease?.projectId === "webapp");
+    expect(holders).toHaveLength(1);
+    expect(["a", "b"]).toContain(holders[0]?.sessionKey);
+    expect((await store.listSessions()).find((s) => s.sessionKey === "older")?.lease).toBeNull();
+  });
 });

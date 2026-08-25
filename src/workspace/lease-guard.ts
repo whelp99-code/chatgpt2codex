@@ -37,7 +37,20 @@ const ALLOWED_CAPABILITIES: Record<LeasePreset, ReadonlySet<LeaseCapability>> = 
  * id, same project, still unexpired: adopt and continue. Absent identity
  * adopts nothing, and a lease belonging to another connector is never touched.
  */
-async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<Lease | undefined> {
+function assertPresetAllows(lease: Lease, capability: LeaseCapability, projectId: string): void {
+  if (ALLOWED_CAPABILITIES[lease.preset].has(capability)) return;
+  throw new DomainError(ErrorCode.PERMISSION_DENIED, `Lease preset ${lease.preset} does not allow ${capability}`, {
+    projectId,
+    preset: lease.preset,
+    capability,
+  });
+}
+
+async function adoptSiblingLease(
+  ctx: ToolContext,
+  projectId: string,
+  capability: LeaseCapability,
+): Promise<Lease | undefined> {
   if (!ctx.clientId || !ctx.store.listSessions) return undefined;
   const sessions = await ctx.store.listSessions();
   const now = Date.now();
@@ -52,27 +65,44 @@ async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<L
   );
   if (!sibling?.lease) return undefined;
 
+  // Refuse before moving. A mismatched call must not strip the sibling of
+  // the connector's only lease; the failing per-call session is swept soon
+  // after and would take that lease with it.
+  assertPresetAllows(sibling.lease, capability, projectId);
+
   // Move it rather than copy it: two sessions holding the same write lease
   // would each pass assertWritable against the other and defeat exclusivity.
-  await ctx.store.setSession(
-    {
-      activeProjectId: projectId,
-      mode: sibling.mode,
-      lease: sibling.lease,
-      clientId: ctx.clientId,
-    },
-    ctx.sessionKey,
-  );
-  await ctx.store.releaseSessionLease?.(sibling.sessionKey);
+  let adopted: Lease = sibling.lease;
+  let fromSlot = sibling.slot;
+  if (ctx.store.adoptConnectorLease) {
+    const moved = await ctx.store.adoptConnectorLease(ctx.sessionKey, ctx.clientId, projectId);
+    if (!moved) return undefined;
+    adopted = moved.lease;
+    fromSlot = moved.fromSlot;
+  } else if (ctx.store.releaseSessionLease) {
+    await ctx.store.setSession(
+      {
+        activeProjectId: projectId,
+        mode: sibling.mode,
+        lease: sibling.lease,
+        clientId: ctx.clientId,
+      },
+      ctx.sessionKey,
+    );
+    await ctx.store.releaseSessionLease(sibling.sessionKey);
+  } else {
+    // Cannot release the source, so do not install a second holder.
+    return undefined;
+  }
   await ctx.ledger
     .append({
       type: "lease.inherited",
       projectId,
-      fromSlot: sibling.slot,
-      preset: sibling.lease.preset,
+      fromSlot,
+      preset: adopted.preset,
     })
     .catch(() => undefined);
-  return sibling.lease;
+  return adopted;
 }
 
 export async function requireProjectLease(
@@ -85,17 +115,11 @@ export async function requireProjectLease(
   try {
     lease = requireLease(session, projectId);
   } catch (err) {
-    const adopted = await adoptSiblingLease(ctx, projectId);
+    const adopted = await adoptSiblingLease(ctx, projectId, capability);
     if (!adopted) throw err;
     lease = adopted;
   }
-  if (!ALLOWED_CAPABILITIES[lease.preset].has(capability)) {
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, `Lease preset ${lease.preset} does not allow ${capability}`, {
-      projectId,
-      preset: lease.preset,
-      capability,
-    });
-  }
+  assertPresetAllows(lease, capability, projectId);
 
   // Second line of defence. project_select already refuses to hand out a
   // conflicting write lease, so reaching here means state drifted — a lease

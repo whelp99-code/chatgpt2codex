@@ -6,6 +6,8 @@ import {
   DomainError,
   ErrorCode,
   STDIO_SESSION_KEY,
+  type ExecutionMode,
+  type Lease,
   type ProjectRegistryEntry,
   type SessionDefaults,
   type SessionSummary,
@@ -166,9 +168,21 @@ function assignSlot(taken: Iterable<string>): string {
 
 export class Store {
   private readonly stateDir: string;
+  /** Serialize session-file mutations so concurrent HTTP handlers cannot
+   * interleave read-modify-write cycles on sessions.json. The file itself is
+   * written atomically (temp + rename); this queue is the cross-key lock. */
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor(stateDir: string) {
     this.stateDir = stateDir;
+  }
+
+  private locked<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn);
+    // Swallow rejections in the chain itself so one failed op doesn't wedge
+    // the queue for subsequent callers; callers still see their own errors.
+    this.queue = run.catch(() => undefined);
+    return run;
   }
 
   /** Ensure the state directory exists with restrictive 0700 permissions. */
@@ -302,24 +316,26 @@ export class Store {
   }
 
   async setSession(s: unknown, sessionKey: string = STDIO_SESSION_KEY): Promise<void> {
-    const incoming = typeof s === "object" && s !== null ? (s as Partial<SessionDocument>) : {};
-    const { file } = await this.loadSessionsFile();
-    const existing = file.sessions[sessionKey];
-    const slot =
-      existing?.slot ??
-      assignSlot(Object.values(file.sessions).map((entry) => entry.slot));
+    return this.locked(async () => {
+      const incoming = typeof s === "object" && s !== null ? (s as Partial<SessionDocument>) : {};
+      const { file } = await this.loadSessionsFile();
+      const existing = file.sessions[sessionKey];
+      const slot =
+        existing?.slot ??
+        assignSlot(Object.values(file.sessions).map((entry) => entry.slot));
 
-    file.sessions[sessionKey] = SessionEntrySchema.parse({
-      activeProjectId: incoming.activeProjectId ?? null,
-      mode: incoming.mode ?? "observe",
-      lease: incoming.lease ?? null,
-      slot,
-      lastActiveAtMs: Date.now(),
-      // Keep a previously recorded client id when this write does not carry
-      // one, so a stdio-shaped update cannot erase the connector identity.
-      clientId: incoming.clientId ?? existing?.clientId,
+      file.sessions[sessionKey] = SessionEntrySchema.parse({
+        activeProjectId: incoming.activeProjectId ?? null,
+        mode: incoming.mode ?? "observe",
+        lease: incoming.lease ?? null,
+        slot,
+        lastActiveAtMs: Date.now(),
+        // Keep a previously recorded client id when this write does not carry
+        // one, so a stdio-shaped update cannot erase the connector identity.
+        clientId: incoming.clientId ?? existing?.clientId,
+      });
+      await this.writeSessionsFile(file);
     });
-    await this.writeSessionsFile(file);
   }
 
   /** Every persisted session, for cross-session conflict checks. */
@@ -342,9 +358,11 @@ export class Store {
   }
 
   async setDefaults(d: SessionDefaults | null): Promise<void> {
-    const { file } = await this.loadSessionsFile();
-    file.defaults = d ? SessionDefaultsSchema.parse(d) : null;
-    await this.writeSessionsFile(file);
+    return this.locked(async () => {
+      const { file } = await this.loadSessionsFile();
+      file.defaults = d ? SessionDefaultsSchema.parse(d) : null;
+      await this.writeSessionsFile(file);
+    });
   }
 
   /**
@@ -356,14 +374,69 @@ export class Store {
    * holding a project hostage.
    */
   async releaseSessionLease(sessionKey: string): Promise<boolean> {
-    const { file } = await this.loadSessionsFile();
-    const entry = file.sessions[sessionKey];
-    if (!entry || !entry.lease) return false;
-    entry.lease = null;
-    entry.activeProjectId = null;
-    entry.mode = "observe";
-    await this.writeSessionsFile(file);
-    return true;
+    return this.locked(async () => {
+      const { file } = await this.loadSessionsFile();
+      const entry = file.sessions[sessionKey];
+      if (!entry || !entry.lease) return false;
+      entry.lease = null;
+      entry.activeProjectId = null;
+      entry.mode = "observe";
+      await this.writeSessionsFile(file);
+      return true;
+    });
+  }
+
+  /**
+   * Move a live lease held by another session of `clientId` onto `sessionKey`.
+   *
+   * Find and transfer happen in one locked write so two per-call sessions
+   * from the same connector cannot both copy the sibling and leave two
+   * holders. The second caller re-finds the first adopter and moves again,
+   * so disk still has exactly one live lease.
+   */
+  async adoptConnectorLease(
+    sessionKey: string,
+    clientId: string,
+    projectId: string,
+  ): Promise<{ lease: Lease; fromSlot: string; mode: ExecutionMode } | undefined> {
+    return this.locked(async () => {
+      const { file } = await this.loadSessionsFile();
+      const now = Date.now();
+      const siblingEntry = Object.entries(file.sessions).find(
+        ([key, entry]) =>
+          key !== sessionKey &&
+          entry.clientId !== undefined &&
+          entry.clientId === clientId &&
+          entry.lease !== null &&
+          entry.lease.projectId === projectId &&
+          entry.lease.expiresAt > now,
+      );
+      if (!siblingEntry) return undefined;
+      const [, sibling] = siblingEntry;
+      const lease = sibling.lease;
+      if (!lease) return undefined;
+
+      const fromSlot = sibling.slot;
+      const mode = sibling.mode;
+      const existing = file.sessions[sessionKey];
+      const slot =
+        existing?.slot ??
+        assignSlot(Object.values(file.sessions).map((entry) => entry.slot));
+
+      file.sessions[sessionKey] = SessionEntrySchema.parse({
+        activeProjectId: projectId,
+        mode,
+        lease,
+        slot,
+        lastActiveAtMs: Date.now(),
+        clientId,
+      });
+      sibling.lease = null;
+      sibling.activeProjectId = null;
+      sibling.mode = "observe";
+      await this.writeSessionsFile(file);
+      return { lease, fromSlot, mode };
+    });
   }
 
   /**
@@ -376,19 +449,21 @@ export class Store {
    * previous process can still be live.
    */
   async sweepSessions(liveKeys: readonly string[] | null): Promise<string[]> {
-    const { file, migrated } = await this.loadSessionsFile();
-    const live = liveKeys === null ? null : new Set(liveKeys);
-    const removed: string[] = [];
-    for (const key of Object.keys(file.sessions)) {
-      if (live === null || !live.has(key)) {
-        removed.push(key);
-        delete file.sessions[key];
+    return this.locked(async () => {
+      const { file, migrated } = await this.loadSessionsFile();
+      const live = liveKeys === null ? null : new Set(liveKeys);
+      const removed: string[] = [];
+      for (const key of Object.keys(file.sessions)) {
+        if (live === null || !live.has(key)) {
+          removed.push(key);
+          delete file.sessions[key];
+        }
       }
-    }
-    // Persist on migration too, even with nothing to remove: leaving a v1
-    // document on disk means every later read re-derives the same defaults
-    // and the file never reflects the format actually in use.
-    if (removed.length > 0 || migrated) await this.writeSessionsFile(file);
-    return removed;
+      // Persist on migration too, even with nothing to remove: leaving a v1
+      // document on disk means every later read re-derives the same defaults
+      // and the file never reflects the format actually in use.
+      if (removed.length > 0 || migrated) await this.writeSessionsFile(file);
+      return removed;
+    });
   }
 }
