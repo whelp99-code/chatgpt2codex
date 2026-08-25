@@ -80,6 +80,8 @@ const SessionSchema = z.object({
   activeProjectId: z.string().nullable(),
   mode: ModeSchema,
   lease: LeaseSchema.nullable(),
+  /** Which connector this session authenticated as, when it has one. */
+  clientId: z.string().optional(),
 });
 
 export type SessionDocument = z.infer<typeof SessionSchema>;
@@ -91,6 +93,9 @@ const SessionEntrySchema = z.object({
   lease: LeaseSchema.nullable(),
   slot: z.string(),
   lastActiveAtMs: z.number().int().nonnegative(),
+  // Optional: absent in files written before takeover existed, and absent for
+  // stdio sessions, which carry no OAuth identity.
+  clientId: z.string().optional(),
 });
 
 const SessionDefaultsSchema = z.object({
@@ -292,6 +297,7 @@ export class Store {
       activeProjectId: entry.activeProjectId,
       mode: entry.mode,
       lease: entry.lease,
+      clientId: entry.clientId,
     };
   }
 
@@ -309,6 +315,9 @@ export class Store {
       lease: incoming.lease ?? null,
       slot,
       lastActiveAtMs: Date.now(),
+      // Keep a previously recorded client id when this write does not carry
+      // one, so a stdio-shaped update cannot erase the connector identity.
+      clientId: incoming.clientId ?? existing?.clientId,
     });
     await this.writeSessionsFile(file);
   }
@@ -323,6 +332,7 @@ export class Store {
       mode: entry.mode,
       lease: entry.lease,
       lastActiveAtMs: entry.lastActiveAtMs,
+      clientId: entry.clientId,
     }));
   }
 
@@ -335,6 +345,25 @@ export class Store {
     const { file } = await this.loadSessionsFile();
     file.defaults = d ? SessionDefaultsSchema.parse(d) : null;
     await this.writeSessionsFile(file);
+  }
+
+  /**
+   * Release one session's lease without deleting the session.
+   *
+   * Used when a connector reappears under a new MCP session id and reclaims
+   * the project its previous session still holds. The stale session stays in
+   * the map — it may still be attached to a live transport — but it stops
+   * holding a project hostage.
+   */
+  async releaseSessionLease(sessionKey: string): Promise<boolean> {
+    const { file } = await this.loadSessionsFile();
+    const entry = file.sessions[sessionKey];
+    if (!entry || !entry.lease) return false;
+    entry.lease = null;
+    entry.activeProjectId = null;
+    entry.mode = "observe";
+    await this.writeSessionsFile(file);
+    return true;
   }
 
   /**

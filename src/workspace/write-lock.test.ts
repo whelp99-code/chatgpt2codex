@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { assertWritable, findVerifyPeers, findWriteLockHolder } from "./project-select.js";
+import {
+  assertWritable,
+  canTakeOverWriteLock,
+  findVerifyPeers,
+  findWriteLockHolder,
+} from "./project-select.js";
 import { DomainError, ErrorCode, type Lease, type SessionSummary } from "../types.js";
 
 /**
@@ -29,7 +34,12 @@ describe("cross-session write lock", () => {
     };
   }
 
-  function session(sessionKey: string, slot: string, l: Lease | null): SessionSummary {
+  function session(
+    sessionKey: string,
+    slot: string,
+    l: Lease | null,
+    clientId?: string,
+  ): SessionSummary {
     return {
       sessionKey,
       slot,
@@ -37,8 +47,41 @@ describe("cross-session write lock", () => {
       mode: "edit",
       lease: l,
       lastActiveAtMs: now,
+      clientId,
     };
   }
+
+  // A conversation that reconnects arrives under a new MCP session id while
+  // its previous session may still be attached to a live transport. Refusing
+  // it locks the conversation out of the project it just took, by itself,
+  // until the lease expires — observed in the field as a 30-minute stall.
+  it("lets a connector reclaim a lease its own earlier session still holds", () => {
+    const sessions = [session("old-session", "W01", lease("webapp", "full-write"), "client-A")];
+    expect(() =>
+      assertWritable(sessions, "webapp", "webapp", "new-session", now, "client-A"),
+    ).not.toThrow();
+  });
+
+  it("still refuses a different connector holding the same project", () => {
+    const sessions = [session("other", "W01", lease("webapp", "full-write"), "client-A")];
+    expect(() =>
+      assertWritable(sessions, "webapp", "webapp", "mine", now, "client-B"),
+    ).toThrow(DomainError);
+  });
+
+  it("does not grant takeover on absent identity", () => {
+    // Stdio callers carry no client id. Treating "unknown equals unknown" as a
+    // match would hand every local caller anyone else's write lease.
+    expect(canTakeOverWriteLock({ clientId: undefined }, undefined)).toBe(false);
+    expect(canTakeOverWriteLock({ clientId: "client-A" }, undefined)).toBe(false);
+    expect(canTakeOverWriteLock({ clientId: undefined }, "client-A")).toBe(false);
+    expect(canTakeOverWriteLock({ clientId: "client-A" }, "client-A")).toBe(true);
+  });
+
+  it("keeps refusing a same-connector holder when the requester is anonymous", () => {
+    const sessions = [session("old", "W01", lease("webapp", "full-write"), "client-A")];
+    expect(() => assertWritable(sessions, "webapp", "webapp", "mine", now)).toThrow(DomainError);
+  });
 
   it("reports the holder when another session has a write lease", () => {
     const sessions = [session("other", "W02", lease("webapp", "full-write"))];

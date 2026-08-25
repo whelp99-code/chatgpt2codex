@@ -30,7 +30,12 @@ function workspaceRootsOf(ctx: ToolContext): string[] {
   if (Array.isArray(roots) && roots.length > 0) return roots;
   return ctx.workspaceRoot ? [ctx.workspaceRoot] : [];
 }
-import { assertWritable, makeLease } from "../workspace/project-select.js";
+import {
+  assertWritable,
+  canTakeOverWriteLock,
+  findWriteLockHolder,
+  makeLease,
+} from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
 
 /** Presets that grant `write`; only these contend for the exclusive lock. */
@@ -86,6 +91,9 @@ interface SessionState {
   activeProjectId: string | null;
   mode: ExecutionMode;
   lease: Lease | null;
+  /** Recorded so a returning connector can be matched to the lease its
+   * previous session left behind. */
+  clientId?: string;
 }
 
 function emptySession(): SessionState {
@@ -1378,7 +1386,23 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         // project someone else is editing.
         if (WRITE_CAPABLE_PRESETS.has(preset) && ctx.store.listSessions) {
           const sessions = await ctx.store.listSessions();
-          assertWritable(sessions, entry.projectId, entry.name, ctx.sessionKey);
+          assertWritable(sessions, entry.projectId, entry.name, ctx.sessionKey, Date.now(), ctx.clientId);
+
+          // Past the check, a surviving holder can only be this same connector
+          // under an older session id. Take the lease off it, or the stale
+          // session and this one both believe they hold the project.
+          const holder = findWriteLockHolder(sessions, entry.projectId, ctx.sessionKey);
+          if (holder && canTakeOverWriteLock(holder, ctx.clientId)) {
+            await ctx.store.releaseSessionLease?.(holder.sessionKey);
+            await ctx.ledger
+              .append({
+                type: "lease.taken_over",
+                projectId: entry.projectId,
+                fromSlot: holder.slot,
+                heldSince: holder.heldSince,
+              })
+              .catch(() => undefined);
+          }
         }
 
         const lease = makeLease(entry, preset);
@@ -1387,6 +1411,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           activeProjectId: entry.projectId,
           mode: "read",
           lease,
+          clientId: ctx.clientId,
         });
 
         await ctx.ledger.append({

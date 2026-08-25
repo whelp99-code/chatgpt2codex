@@ -521,9 +521,14 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         // call arrives later still, so by the time anything reads this the id
         // is populated; binding the value eagerly here would capture
         // undefined and collapse all sessions back onto one shared lease.
+        // Captured at initialize, when the bearer has just been verified. The
+        // session id can change under a reconnect; this does not, which is
+        // what lets a returning connector reclaim its own lease.
+        const authClientId = req.auth?.clientId;
         const sessionScopedCtx: ToolContext = {
           ...ctx,
           remote: true,
+          clientId: authClientId,
           get sessionKey(): string {
             return transport?.sessionId ?? STDIO_SESSION_KEY;
           },
