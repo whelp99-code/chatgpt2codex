@@ -36,6 +36,8 @@ export function makeLease(entry: ProjectRegistryEntry, preset: LeasePreset): Lea
 export interface WriteLockHolder {
   slot: string;
   sessionKey: string;
+  /** Absent for stdio holders and for sessions persisted before takeover. */
+  clientId?: string;
   heldSince: number;
   expiresAt: number;
 }
@@ -75,6 +77,7 @@ export function findWriteLockHolder(
     return {
       slot: session.slot,
       sessionKey: session.sessionKey,
+      clientId: session.clientId,
       heldSince: lease.issuedAt,
       expiresAt: lease.expiresAt,
     };
@@ -109,15 +112,48 @@ export function findVerifyPeers(
 /** Throw PROJECT_LOCKED when another live session already holds the write
  * lease. Called both when a lease is issued (fail fast, before the model
  * plans work it cannot do) and again at write time as a second line. */
+/**
+ * Whether a held write lock should be handed to the requester instead of
+ * refusing them.
+ *
+ * An MCP session id is not stable for the life of a conversation: a client can
+ * reconnect and arrive under a new one while its previous session is still
+ * attached to a live transport. The sweep only reclaims leases whose transport
+ * is gone, so that stale session keeps the project — and the very conversation
+ * that took the lease is locked out of it, by itself, until the lease expires.
+ * Observed in the field: a full-write lease granted at 04:11:40, its own next
+ * tool call refused at 04:12:05, and re-selecting refused as PROJECT_LOCKED
+ * twelve seconds later.
+ *
+ * One OAuth client id is one connector. When the holder authenticated as the
+ * same client the requester did, this is that connector coming back, so the
+ * lock moves rather than standing in its own way. Different client ids are
+ * genuinely different callers and are still refused.
+ *
+ * Stdio callers have no client id; absent identity never grants takeover.
+ */
+export function canTakeOverWriteLock(
+  holder: Pick<WriteLockHolder, "clientId">,
+  requesterClientId: string | undefined,
+): boolean {
+  return (
+    requesterClientId !== undefined &&
+    holder.clientId !== undefined &&
+    holder.clientId === requesterClientId
+  );
+}
+
 export function assertWritable(
   sessions: readonly SessionSummary[],
   projectId: string,
   projectLabel: string,
   selfSessionKey: string,
   now: number = Date.now(),
+  requesterClientId?: string,
 ): void {
   const holder = findWriteLockHolder(sessions, projectId, selfSessionKey, now);
   if (!holder) return;
+  if (canTakeOverWriteLock(holder, requesterClientId)) return;
   const until = new Date(holder.expiresAt).toISOString().slice(11, 16);
   throw new DomainError(
     ErrorCode.PROJECT_LOCKED,

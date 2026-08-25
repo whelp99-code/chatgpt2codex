@@ -69,6 +69,10 @@ export const STDIO_SESSION_KEY = "stdio";
 /** One persisted MCP session's lease state, as returned by `listSessions`. */
 export interface SessionSummary {
   sessionKey: string;
+  /** OAuth client the session authenticated as, when it arrived over HTTP.
+   * Two MCP sessions sharing one client id are the same connector — which is
+   * how a conversation that silently rotated its session id is recognised. */
+  clientId?: string;
   /** Short human-facing label (`W01`, `W02`, ...). Session keys are UUIDs and
    * are unreadable in error messages and dashboards. */
   slot: string;
@@ -143,11 +147,17 @@ export interface ToolContext {
     /** Project a brand-new session inherits when it has not selected one. */
     getDefaults?(): Promise<SessionDefaults | null>;
     setDefaults?(d: SessionDefaults | null): Promise<void>;
+    /** Release one session's lease, keeping the session itself. Returns false
+     * when the session is unknown or already holds nothing. */
+    releaseSessionLease?(sessionKey: string): Promise<boolean>;
     /** Drop every session not listed in `liveKeys` (pass `null` to drop all),
      * returning the keys removed. Releases leases held by transports that are
      * gone so a closed conversation cannot keep a project locked. */
     sweepSessions?(liveKeys: readonly string[] | null): Promise<string[]>;
   };
+  /** OAuth client id of the connector this context serves, when known.
+   * Absent for stdio callers, which have no OAuth identity. */
+  clientId?: string;
   /** Which MCP session this context serves. One ChatGPT conversation maps to
    * one key; local stdio callers share the fixed `STDIO_SESSION_KEY`. */
   sessionKey: string;
