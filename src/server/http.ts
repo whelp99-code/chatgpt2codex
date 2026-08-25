@@ -526,7 +526,8 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
-          if (closedSessionId) sessions.delete(closedSessionId);
+          if (!closedSessionId) return;
+          sessions.delete(closedSessionId);
           void ctx.ledger
             .append({
               type: "session.closed",
