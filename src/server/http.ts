@@ -446,7 +446,15 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     }
     // Keep persisted leases in step with live transports: a session that went
     // away without a clean close must not keep holding its project.
-    void ctx.store.sweepSessions?.([...sessions.keys()]);
+    void Promise.resolve(ctx.store.sweepSessions?.([...sessions.keys()]))
+      .then((removed) => {
+        if (!removed || removed.length === 0) return undefined;
+        // Which sessions the sweep reclaimed, and therefore which leases were
+        // released without anyone asking. Reconstructing that from timestamps
+        // is what made the last lease incident an inference exercise.
+        return ctx.ledger.append({ type: "session.swept", sessionKeys: removed, count: removed.length });
+      })
+      .catch(() => undefined);
     if (
       config.idleShutdownMs !== undefined &&
       config.idleShutdownMs > 0 &&
@@ -502,12 +510,30 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
               lastSessionActivityAtMs = Date.now();
               sessions.set(newSessionId, { transport, lastActiveAtMs: lastSessionActivityAtMs });
             }
+            // The only point where the id exists and the session is new. It is
+            // assigned during handleRequest, which runs after connect(), so
+            // anything logged earlier names a session with no session id.
+            void ctx.ledger
+              .append({
+                type: "session.opened",
+                sessionKey: newSessionId,
+                clientId: req.auth?.clientId,
+                transport: "http",
+              })
+              .catch(() => undefined);
           },
         });
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
           if (closedSessionId) sessions.delete(closedSessionId);
+          void ctx.ledger
+            .append({
+              type: "session.closed",
+              sessionKey: closedSessionId,
+              clientId: req.auth?.clientId,
+            })
+            .catch(() => undefined);
         };
 
         // Mark this session remote: it's how ChatGPT (and any other network
@@ -529,12 +555,24 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
           ...ctx,
           remote: true,
           clientId: authClientId,
+          // Stamp every event this session emits with who emitted it. Done
+          // here rather than at each of the thirty append sites so no future
+          // event can forget, and so the identity cannot drift between them.
+          ledger: {
+            append: (event) =>
+              ctx.ledger.append({
+                ...event,
+                sessionKey: transport?.sessionId,
+                clientId: authClientId,
+              }),
+          },
           get sessionKey(): string {
             return transport?.sessionId ?? STDIO_SESSION_KEY;
           },
         };
         const mcpServer = await createMcpServer(sessionScopedCtx);
         await mcpServer.connect(transport);
+
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
         return;
