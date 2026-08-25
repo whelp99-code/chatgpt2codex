@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { requireProjectLease, verifyPeerWarnings } from "./lease-guard.js";
 import { makeLease } from "./project-select.js";
+import type { Lease, SessionSummary, ToolContext } from "../types.js";
 import { Store } from "../state/store.js";
 import {
   DomainError,
@@ -160,5 +161,124 @@ describe("requireProjectLease across sessions", () => {
     await select("stdio", webapp, "full-write");
     const ctx = ctxFor("stdio");
     await expect(requireProjectLease(ctx, "webapp", "write")).resolves.toBeTruthy();
+  });
+});
+
+describe("lease follows the connector, not the session id", () => {
+  // ChatGPT opens a new MCP session per tool call, so a lease bound to the
+  // session that took it is lost by the very next call.
+  const now = Date.now();
+
+  function lease(projectId: string, preset: Lease["preset"]): Lease {
+    return {
+      projectId,
+      leaseId: `lease_${projectId}`,
+      projectRoot: `/w/${projectId}`,
+      preset,
+      issuedAt: now - 1000,
+      expiresAt: now + 600_000,
+    };
+  }
+
+  function ctxWith(
+    sessions: SessionSummary[],
+    sessionKey: string,
+    clientId: string | undefined,
+    onSet: (s: unknown, key?: string) => void = () => undefined,
+    onRelease: (key: string) => void = () => undefined,
+  ): ToolContext {
+    return {
+      workspaceRoot: "/w",
+      workspaceRoots: ["/w"],
+      stateDir: "/tmp",
+      registry: [],
+      ledger: { append: async () => undefined },
+      clientId,
+      sessionKey,
+      store: {
+        loadProjects: async () => [],
+        saveProjects: async () => undefined,
+        getSession: async (key?: string) => sessions.find((s) => s.sessionKey === key) ?? null,
+        setSession: async (s: unknown, key?: string) => onSet(s, key),
+        listSessions: async () => sessions,
+        releaseSessionLease: async (key: string) => {
+          onRelease(key);
+          return true;
+        },
+      },
+      config: {} as ToolContext["config"],
+    } as unknown as ToolContext;
+  }
+
+  it("adopts a live lease held by another session of the same connector", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "older",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    let released: string | undefined;
+    const ctx = ctxWith(sessions, "newer", "client-A", () => undefined, (k) => {
+      released = k;
+    });
+
+    const got = await requireProjectLease(ctx, "webapp", "write");
+    expect(got.preset).toBe("full-write");
+    // Moved, not copied: two holders would each pass the exclusivity check
+    // against the other.
+    expect(released).toBe("older");
+  });
+
+  it("does not adopt a lease from a different connector", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "other",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-B",
+      },
+    ];
+    const ctx = ctxWith(sessions, "mine", "client-A");
+    await expect(requireProjectLease(ctx, "webapp", "write")).rejects.toThrow();
+  });
+
+  it("adopts nothing when the caller has no connector identity", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "other",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const ctx = ctxWith(sessions, "stdio", undefined);
+    await expect(requireProjectLease(ctx, "webapp", "read")).rejects.toThrow();
+  });
+
+  it("does not adopt an expired sibling lease", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "older",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: { ...lease("webapp", "full-write"), expiresAt: now - 1 },
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const ctx = ctxWith(sessions, "newer", "client-A");
+    await expect(requireProjectLease(ctx, "webapp", "read")).rejects.toThrow();
   });
 });
