@@ -391,7 +391,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     // no business holding a handle to transport state it could mutate.
     activity: () => new Map([...sessions].map(([id, tracked]) => [id, tracked.lastActiveAtMs])),
     history: () => sessionHistory.list(),
-    queue: () => new WorkQueue(ctx.stateDir).openItems(),
+    queue: () => new WorkQueue(ctx.stateDir).boardItems(),
   });
 
   app.get("/privacy", (_req, res) => {
@@ -477,6 +477,18 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       // released without anyone asking. Reconstructing that from timestamps
       // is what made the last lease incident an inference exercise.
       await ctx.ledger.append({ type: "session.swept", sessionKeys: removed, count: removed.length });
+
+      // The same sweep that reclaims a dead window's lease should free the
+      // work it was holding: an item handed to a window that never came back
+      // is neither finished nor available to anyone else.
+      const revived = await new WorkQueue(ctx.stateDir).requeueAbandoned(config.sessionTtlMs);
+      if (revived.length > 0) {
+        await ctx.ledger.append({
+          type: "work.requeued",
+          count: revived.length,
+          projectIds: [...new Set(revived.map((i) => i.projectId))],
+        });
+      }
     })().catch(() => undefined);
     if (
       config.idleShutdownMs !== undefined &&

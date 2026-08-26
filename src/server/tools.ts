@@ -1019,6 +1019,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         mode: z.enum(["implement", "research", "debug", "review", "plan"]).optional(),
         maxTurns: z.number().int().min(1).max(50).optional(),
         lastResult: z.string().optional(),
+        /** How the assigned work ended. Defaults to done — a worker that says
+         * nothing is reporting an ordinary finish; one that is stuck has to
+         * say so, or the manager cannot tell the two apart and will never
+         * reassign it. */
+        lastOutcome: z.enum(["done", "failed", "blocked"]).optional(),
       },
     },
     async (input) => {
@@ -1041,7 +1046,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const remainingTurns = Math.max(0, maxTurns - turn);
         const nextActions = input.projectId
           ? [
-              `Call project_select with projectId=${input.projectId}, preset=full-write, reason=loop ${loopId} turn ${turn}.`,
+              // Naming the window is what makes the per-project guard work.
+              // Unnamed windows share one OAuth client and are indistinguishable,
+              // so each silently takes the project from the last; putting the
+              // instruction here means a worker adopts the convention without
+              // anyone having to remember it.
+              `Call project_select with projectId=${input.projectId}, preset=full-write, workerName=${loopId.slice(-6)}, reason=loop ${loopId} turn ${turn}.`,
               "Call project_rules and project_status if they are not already fresh in this chat.",
               "Read the smallest relevant context slice, apply one coherent patch/create batch, then run the closest verification command.",
               `Call goal_loop again with loopId=${loopId}, projectId=${input.projectId}, maxTurns=${maxTurns}, and lastResult summarizing the batch.`,
@@ -1064,7 +1074,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               const inFlight = (await queue.openItems()).find(
                 (i) => i.projectId === input.projectId && i.status === "delivered",
               );
-              if (inFlight) await queue.report(inFlight.id, "done", input.lastResult);
+              if (inFlight) {
+                // "blocked" is recorded as failed: both mean the manager has
+                // to look at it, and a third state the board renders the same
+                // way would only add a distinction nobody acts on.
+                const outcome = input.lastOutcome === "done" || input.lastOutcome === undefined
+                  ? "done"
+                  : "failed";
+                await queue.report(inFlight.id, outcome, input.lastResult);
+              }
             }
             const next = await queue.takeNext(input.projectId);
             if (next) assignment = { id: next.id, instruction: next.instruction };
@@ -1112,7 +1130,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             ],
           },
           assignment
-            ? `Loop ${loopId} turn ${turn}: the manager assigned new work. Do it, then call goal_loop again with lastResult.`
+            ? `Loop ${loopId} turn ${turn}: the manager assigned new work. Do it, then call goal_loop again with lastResult, and lastOutcome=failed or blocked if it did not finish.`
             : `Loop ${loopId} turn ${turn} ready. Execute the next action batch now, then call goal_loop again unless done or blocked.`,
         );
       });

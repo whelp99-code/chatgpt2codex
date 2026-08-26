@@ -563,6 +563,8 @@ tr:last-child td{border-bottom:0}
 .pill.w{color:var(--warn);border-color:#5c4813}
 .pill.r{color:var(--dim)}
 .pill.a{color:var(--ok);border-color:#1f6f34}
+.pill.e{color:var(--err);border-color:#5c1e1c}
+.qresult{color:var(--dim);font-size:12px;margin-top:4px;white-space:pre-wrap;word-break:break-word}
 .done{color:var(--dim);font-size:12px;white-space:nowrap}
 .qform{display:flex;gap:8px;padding:12px 16px;flex-wrap:wrap}
 .qform select,.qform input{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:13px/1.4 inherit}
@@ -651,17 +653,28 @@ function historyRow(status: InstanceStatus): string {
 function queueRow(status: InstanceStatus): string {
   const queue = status.queue ?? [];
   if (queue.length === 0) return "";
-  const items = queue
-    .slice(0, 8)
+  const badge = (item: WorkItem): { cls: string; label: string } => {
+    if (item.status === "delivered") return { cls: "pill w", label: "진행 중" };
+    if (item.status === "done") return { cls: "pill a", label: "완료" };
+    if (item.status === "failed") return { cls: "pill e", label: "실패" };
+    return { cls: "pill r", label: "대기" };
+  };
+  const rows = queue
     .map((item) => {
-      const cls = item.status === "delivered" ? "pill w" : "pill r";
-      const label = item.status === "delivered" ? "진행 지시됨" : "대기";
-      return `<span class="done"><span class="${cls}">${label}</span> ${esc(item.projectId)} — ${esc(
-        item.instruction.slice(0, 60),
-      )}</span>`;
+      const { cls, label } = badge(item);
+      // The reported result is the point of the board for a manager: without
+      // it a finished item says only that it stopped, not what happened.
+      const result = item.result
+        ? `<div class="qresult">${esc(item.result.slice(0, 300))}</div>`
+        : "";
+      return `<tr>
+        <td><span class="${cls}">${label}</span></td>
+        <td>${esc(item.projectId)}</td>
+        <td>${esc(item.instruction.slice(0, 90))}${result}</td>
+      </tr>`;
     })
-    .join(" &nbsp;·&nbsp; ");
-  return `<div class="empty">작업 지시 &nbsp; ${items}</div>`;
+    .join("");
+  return `<table><thead><tr><th>상태</th><th>프로젝트</th><th>지시 / 결과</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function instanceCard(status: InstanceStatus | InstanceError): string {
