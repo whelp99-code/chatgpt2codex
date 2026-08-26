@@ -343,6 +343,32 @@ describe("renderDashboard", () => {
     expect(html).not.toContain("undefined");
   });
 
+  it("shows recently finished sessions with the same label shape as live ones", () => {
+    const html = renderDashboard([
+      status({
+        history: [
+          { slot: "W01", projectName: "chatgpt2codex-repo", endedAt: Date.UTC(2026, 7, 26, 14, 32), lastActiveAtMs: 0 },
+          { slot: "W02", projectName: null, endedAt: Date.UTC(2026, 7, 26, 13, 5), lastActiveAtMs: 0 },
+        ],
+      }),
+    ]);
+    expect(html).toContain("chatgpt2codex-repo (W01)");
+    expect(html).toContain("(W02)");
+    expect(html).toContain("14:32");
+    expect(html).not.toContain("null");
+  });
+
+  it("says so plainly when nothing has finished yet", () => {
+    expect(renderDashboard([status({ history: [] })])).toContain("최근 완료된 작업이 없습니다");
+  });
+
+  it("renders a peer that predates history without treating it as an error", () => {
+    // Older peers simply omit the field; the card must still draw.
+    const html = renderDashboard([status()]);
+    expect(html).toContain("ubuntu-server");
+    expect(html).toContain("최근 완료된 작업이 없습니다");
+  });
+
   it("counts only leased slots as active", () => {
     const html = renderDashboard([
       status({
