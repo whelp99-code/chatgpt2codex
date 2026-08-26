@@ -26,7 +26,7 @@ const INSTANCE_NAME_FILE = "instance-name.txt";
 /** How long after its last tool call a session still counts as working. A
  * model calling tools in sequence pauses for seconds; a person reading the
  * answer before typing again pauses for minutes. 90s sits between the two. */
-const DEFAULT_ACTIVE_WINDOW_MS = 90_000;
+export const DEFAULT_ACTIVE_WINDOW_MS = 90_000;
 
 /**
  * Read a duration from the environment, falling back on anything unusable.
