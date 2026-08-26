@@ -46,6 +46,16 @@ async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<L
   if (!ctx.clientId || !ctx.store.listSessions || !ctx.store.releaseSessionLease) return undefined;
   const sessions = await ctx.store.listSessions();
   const now = Date.now();
+  // Read this session's own name so a sibling belonging to a different window
+  // of the same connector is not adopted from.
+  let myName: string | undefined;
+  try {
+    const self = (await ctx.store.getSession(ctx.sessionKey)) as { workerName?: string } | null;
+    myName = self?.workerName;
+  } catch {
+    myName = undefined;
+  }
+
   const sibling = sessions.find(
     (s) =>
       s.sessionKey !== ctx.sessionKey &&
@@ -53,7 +63,9 @@ async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<L
       s.clientId === ctx.clientId &&
       s.lease !== null &&
       s.lease.projectId === projectId &&
-      s.lease.expiresAt > now,
+      s.lease.expiresAt > now &&
+      // Both named and different means a different window; leave it alone.
+      !(myName !== undefined && s.workerName !== undefined && myName !== s.workerName),
   );
   if (!sibling?.lease) return undefined;
 
@@ -65,6 +77,7 @@ async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<L
       mode: sibling.mode,
       lease: sibling.lease,
       clientId: ctx.clientId,
+      workerName: myName ?? sibling.workerName,
     },
     ctx.sessionKey,
   );

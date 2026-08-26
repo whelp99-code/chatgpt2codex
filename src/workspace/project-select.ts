@@ -38,6 +38,8 @@ export interface WriteLockHolder {
   sessionKey: string;
   /** Absent for stdio holders and for sessions persisted before takeover. */
   clientId?: string;
+  /** Name the holding conversation gave itself, when it gave one. */
+  workerName?: string;
   heldSince: number;
   expiresAt: number;
 }
@@ -78,6 +80,7 @@ export function findWriteLockHolder(
       slot: session.slot,
       sessionKey: session.sessionKey,
       clientId: session.clientId,
+      workerName: session.workerName,
       heldSince: lease.issuedAt,
       expiresAt: lease.expiresAt,
     };
@@ -133,14 +136,21 @@ export function findVerifyPeers(
  * Stdio callers have no client id; absent identity never grants takeover.
  */
 export function canTakeOverWriteLock(
-  holder: Pick<WriteLockHolder, "clientId">,
+  holder: Pick<WriteLockHolder, "clientId" | "workerName">,
   requesterClientId: string | undefined,
+  requesterWorkerName?: string,
 ): boolean {
-  return (
-    requesterClientId !== undefined &&
-    holder.clientId !== undefined &&
-    holder.clientId === requesterClientId
-  );
+  if (requesterClientId === undefined || holder.clientId === undefined) return false;
+  if (holder.clientId !== requesterClientId) return false;
+  // Same connector is necessary but no longer sufficient. Ten ChatGPT windows
+  // share one client id, so unnamed they are indistinguishable and each would
+  // silently take the project from the last — two conversations editing one
+  // repository while both believe they hold it. When both sides named
+  // themselves, only a matching name is the same worker returning.
+  if (holder.workerName !== undefined && requesterWorkerName !== undefined) {
+    return holder.workerName === requesterWorkerName;
+  }
+  return true;
 }
 
 export function assertWritable(
@@ -150,18 +160,21 @@ export function assertWritable(
   selfSessionKey: string,
   now: number = Date.now(),
   requesterClientId?: string,
+  requesterWorkerName?: string,
 ): void {
   const holder = findWriteLockHolder(sessions, projectId, selfSessionKey, now);
   if (!holder) return;
-  if (canTakeOverWriteLock(holder, requesterClientId)) return;
+  if (canTakeOverWriteLock(holder, requesterClientId, requesterWorkerName)) return;
   const until = new Date(holder.expiresAt).toISOString().slice(11, 16);
   throw new DomainError(
     ErrorCode.PROJECT_LOCKED,
-    `${projectLabel} is being edited by another session (slot ${holder.slot}, until ${until} UTC). ` +
+    `${projectLabel} is being edited by ${holder.workerName ? `worker "${holder.workerName}"` : "another session"} ` +
+      `(slot ${holder.slot}, until ${until} UTC). ` +
       `Close that conversation or wait for its lease to expire, or select this project read-only.`,
     {
       projectId,
       heldBySlot: holder.slot,
+      heldByWorker: holder.workerName,
       heldSince: holder.heldSince,
       expiresAt: holder.expiresAt,
       holderPreset: "full-write",

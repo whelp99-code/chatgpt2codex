@@ -82,6 +82,7 @@ const SessionSchema = z.object({
   lease: LeaseSchema.nullable(),
   /** Which connector this session authenticated as, when it has one. */
   clientId: z.string().optional(),
+  workerName: z.string().optional(),
 });
 
 export type SessionDocument = z.infer<typeof SessionSchema>;
@@ -96,6 +97,7 @@ const SessionEntrySchema = z.object({
   // Optional: absent in files written before takeover existed, and absent for
   // stdio sessions, which carry no OAuth identity.
   clientId: z.string().optional(),
+  workerName: z.string().optional(),
 });
 
 const SessionDefaultsSchema = z.object({
@@ -298,6 +300,7 @@ export class Store {
       mode: entry.mode,
       lease: entry.lease,
       clientId: entry.clientId,
+      workerName: entry.workerName,
     };
   }
 
@@ -318,6 +321,7 @@ export class Store {
       // Keep a previously recorded client id when this write does not carry
       // one, so a stdio-shaped update cannot erase the connector identity.
       clientId: incoming.clientId ?? existing?.clientId,
+      workerName: incoming.workerName ?? existing?.workerName,
     });
     await this.writeSessionsFile(file);
   }
@@ -333,6 +337,7 @@ export class Store {
       lease: entry.lease,
       lastActiveAtMs: entry.lastActiveAtMs,
       clientId: entry.clientId,
+      workerName: entry.workerName,
     }));
   }
 

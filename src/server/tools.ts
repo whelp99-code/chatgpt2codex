@@ -95,6 +95,8 @@ interface SessionState {
   /** Recorded so a returning connector can be matched to the lease its
    * previous session left behind. */
   clientId?: string;
+  /** Distinguishes two windows of that same connector. */
+  workerName?: string;
 }
 
 function emptySession(): SessionState {
@@ -1423,6 +1425,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         reason: z.string(),
         preset: z.enum(["read-only", "tests-only", "full-write", "image-only", "control"]).optional(),
         confirmSwitch: z.boolean().optional(),
+        /** Name this conversation, e.g. "w1". Every ChatGPT window shares one
+         * OAuth client, so without a name two windows on one project are
+         * indistinguishable and will take the lease from each other. */
+        workerName: z.string().min(1).max(40).optional(),
       },
     },
     async (input) => {
@@ -1477,13 +1483,21 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         // project someone else is editing.
         if (WRITE_CAPABLE_PRESETS.has(preset) && ctx.store.listSessions) {
           const sessions = await ctx.store.listSessions();
-          assertWritable(sessions, entry.projectId, entry.name, ctx.sessionKey, Date.now(), ctx.clientId);
+          assertWritable(
+            sessions,
+            entry.projectId,
+            entry.name,
+            ctx.sessionKey,
+            Date.now(),
+            ctx.clientId,
+            input.workerName,
+          );
 
           // Past the check, a surviving holder can only be this same connector
           // under an older session id. Take the lease off it, or the stale
           // session and this one both believe they hold the project.
           const holder = findWriteLockHolder(sessions, entry.projectId, ctx.sessionKey);
-          if (holder && canTakeOverWriteLock(holder, ctx.clientId)) {
+          if (holder && canTakeOverWriteLock(holder, ctx.clientId, input.workerName)) {
             await ctx.store.releaseSessionLease?.(holder.sessionKey);
             await ctx.ledger
               .append({
@@ -1503,6 +1517,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           mode: "read",
           lease,
           clientId: ctx.clientId,
+          workerName: input.workerName,
         });
 
         await ctx.ledger.append({
