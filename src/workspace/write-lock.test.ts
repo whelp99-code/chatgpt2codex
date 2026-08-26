@@ -240,3 +240,79 @@ describe("different projects stay independent", () => {
     expect(() => assertWritable(sessions, "api", "api", "s2", now, "client-B")).not.toThrow();
   });
 });
+
+/**
+ * Ten ChatGPT windows authenticate as one OAuth client, so client id alone
+ * cannot tell them apart. Unnamed, each would take the project from the last
+ * and two conversations would edit one repository believing they held it.
+ */
+describe("worker names separate windows of one connector", () => {
+  const now = 3_000_000;
+
+  function lease(projectId: string): Lease {
+    return {
+      projectId,
+      leaseId: `lease_${projectId}`,
+      projectRoot: `/w/${projectId}`,
+      preset: "full-write",
+      issuedAt: now - 1000,
+      expiresAt: now + 600_000,
+    };
+  }
+
+  function held(workerName?: string): SessionSummary[] {
+    return [
+      {
+        sessionKey: "holder",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+        workerName,
+      },
+    ];
+  }
+
+  it("refuses a different named window of the same connector", () => {
+    expect(() =>
+      assertWritable(held("w1"), "webapp", "webapp", "s2", now, "client-A", "w2"),
+    ).toThrow(DomainError);
+  });
+
+  it("still lets the same named window reclaim its own lease", () => {
+    expect(() =>
+      assertWritable(held("w1"), "webapp", "webapp", "s2", now, "client-A", "w1"),
+    ).not.toThrow();
+  });
+
+  it("names the holder so the owner knows which window to close", () => {
+    let caught: unknown;
+    try {
+      assertWritable(held("w1"), "webapp", "webapp", "s2", now, "client-A", "w2");
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as DomainError).message).toContain('worker "w1"');
+    expect((caught as DomainError).details).toMatchObject({ heldByWorker: "w1" });
+  });
+
+  it("keeps working when neither side is named", () => {
+    // Existing behaviour for anyone who never adopts names.
+    expect(() =>
+      assertWritable(held(), "webapp", "webapp", "s2", now, "client-A"),
+    ).not.toThrow();
+  });
+
+  it("does not refuse when only one side is named", () => {
+    // A half-named pair is ambiguous; refusing would strand a conversation
+    // that predates the naming convention.
+    expect(() =>
+      assertWritable(held("w1"), "webapp", "webapp", "s2", now, "client-A"),
+    ).not.toThrow();
+    expect(() =>
+      assertWritable(held(), "webapp", "webapp", "s2", now, "client-A", "w2"),
+    ).not.toThrow();
+  });
+});

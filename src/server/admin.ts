@@ -1,8 +1,9 @@
 import { hostname, platform } from "node:os";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type { Express, Request, Response } from "express";
+import { urlencoded, type Express, type Request, type Response } from "express";
 import type { SessionSummary, ToolContext } from "../types.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { SessionHistoryRecord } from "../state/session-history.js";
@@ -337,6 +338,45 @@ function presentedToken(req: Request): string | undefined {
   return typeof query === "string" ? query : undefined;
 }
 
+/**
+ * Short-lived tokens tying a queue form to the browser session that was shown
+ * it.
+ *
+ * The JSON endpoint takes a bearer header, which a cross-site page cannot set.
+ * A form cannot send headers, so it authenticates with the dashboard cookie —
+ * and a cookie is attached by any page that can make the browser navigate.
+ * Without a token in the form body, a page the owner merely visited could
+ * queue work on their behalf. Held in memory: they expire in minutes and
+ * losing them on restart costs one refresh.
+ */
+const formTokens = new Map<string, number>();
+const FORM_TOKEN_TTL_MS = 30 * 60 * 1000;
+const MAX_FORM_TOKENS = 200;
+
+function issueFormToken(): string {
+  const now = Date.now();
+  for (const [token, expiry] of formTokens) {
+    if (expiry < now) formTokens.delete(token);
+  }
+  // Bounded so a page that is reloaded endlessly cannot grow this forever.
+  while (formTokens.size >= MAX_FORM_TOKENS) {
+    const oldest = formTokens.keys().next().value;
+    if (oldest === undefined) break;
+    formTokens.delete(oldest);
+  }
+  const token = randomUUID();
+  formTokens.set(token, now + FORM_TOKEN_TTL_MS);
+  return token;
+}
+
+function consumeFormToken(token: unknown): boolean {
+  if (typeof token !== "string") return false;
+  const expiry = formTokens.get(token);
+  if (expiry === undefined) return false;
+  formTokens.delete(token);
+  return expiry >= Date.now();
+}
+
 export function registerAdminRoutes(
   app: Express,
   ctx: ToolContext,
@@ -368,6 +408,55 @@ export function registerAdminRoutes(
    * visited; requiring the header means a browser cannot be tricked into
    * queueing work on the owner's behalf.
    */
+  /**
+   * Same queueing action, reached from the dashboard form.
+   *
+   * Separate from the JSON endpoint because it authenticates differently: a
+   * form cannot set an Authorization header, so this accepts the dashboard
+   * cookie and demands a one-time token that only a page this server rendered
+   * could carry. The JSON route stays bearer-only precisely so that it cannot
+   * be reached by a browser at all.
+   */
+  // Only this route parses form bodies. The MCP app ships a JSON parser and
+  // nothing else, and widening that globally would start accepting form posts
+  // on endpoints that were never written to expect them.
+  app.post("/admin/queue-form", urlencoded({ extended: false, limit: "16kb" }), async (req, res) => {
+    const candidate = presentedToken(req);
+    if (!candidate || !(await verifyOwnerToken(ctx.stateDir, candidate))) {
+      await penalize();
+      res.status(401).type("html").send(loginHtml());
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!consumeFormToken(body.form_token)) {
+      res.status(403).type("html").send(noticePage("이 양식은 만료되었습니다. 새로고침 후 다시 시도하세요."));
+      return;
+    }
+    const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+    const instruction = typeof body.instruction === "string" ? body.instruction.trim() : "";
+    if (!projectId || !instruction) {
+      res.status(400).type("html").send(noticePage("프로젝트와 지시 내용을 모두 입력하세요."));
+      return;
+    }
+    const projects = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
+    if (!projects.some((p) => p.projectId === projectId)) {
+      res.status(404).type("html").send(noticePage(`알 수 없는 프로젝트: ${projectId}`));
+      return;
+    }
+    try {
+      const item = await new WorkQueue(ctx.stateDir).enqueue(projectId, instruction);
+      await ctx.ledger.append({ type: "work.queued", projectId, itemId: item.id }).catch(() => undefined);
+    } catch (err) {
+      res
+        .status(409)
+        .type("html")
+        .send(noticePage(err instanceof Error ? err.message : "작업을 넣지 못했습니다."));
+      return;
+    }
+    // Redirect after POST so a refresh does not resubmit the instruction.
+    res.redirect(303, "/admin");
+  });
+
   app.post("/admin/queue", async (req, res) => {
     const header = req.header("authorization");
     const bearer = header?.startsWith("Bearer ") ? header.slice(7).trim() : undefined;
@@ -428,7 +517,13 @@ export function registerAdminRoutes(
     const peers = await loadPeers(ctx.stateDir);
     const peerResults = await Promise.all(peers.map((peer) => fetchPeerStatus(peer)));
     const instances = [await localStatus(ctx, options.maxSlots, options), ...peerResults];
-    res.type("html").send(renderDashboard(instances));
+    const projects = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
+    res.type("html").send(
+      renderDashboard(instances, {
+        formToken: issueFormToken(),
+        projects: projects.map((p) => ({ projectId: p.projectId, name: p.name })),
+      }),
+    );
   });
 }
 
@@ -469,6 +564,10 @@ tr:last-child td{border-bottom:0}
 .pill.r{color:var(--dim)}
 .pill.a{color:var(--ok);border-color:#1f6f34}
 .done{color:var(--dim);font-size:12px;white-space:nowrap}
+.qform{display:flex;gap:8px;padding:12px 16px;flex-wrap:wrap}
+.qform select,.qform input{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:13px/1.4 inherit}
+.qform input{flex:1;min-width:220px}
+.qform button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 14px;font:13px/1.4 inherit;cursor:pointer}
 .empty{padding:16px;color:var(--dim);font-size:13px}
 .err{border-color:#5c1e1c}
 .err>h2{color:var(--err)}
@@ -594,7 +693,39 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
   </section>`;
 }
 
-export function renderDashboard(instances: (InstanceStatus | InstanceError)[]): string {
+/** Form for queueing work, shown only when the page can supply a token. */
+/** Small page for a rejected form submission, with a way back. */
+function noticePage(message: string): string {
+  return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>chatgpt2codex</title><style>${STYLE}</style></head>
+<body><main><section class="inst">
+  <h2>작업 지시</h2>
+  <div class="empty">${esc(message)}</div>
+  <div class="empty"><a href="/admin" style="color:var(--accent)">대시보드로 돌아가기</a></div>
+</section></main></body></html>`;
+}
+
+function queueForm(projects: { projectId: string; name: string }[], formToken?: string): string {
+  if (!formToken || projects.length === 0) return "";
+  const options = projects
+    .map((p) => `<option value="${esc(p.projectId)}">${esc(p.name)}</option>`)
+    .join("");
+  return `<section class="inst">
+    <h2>작업 지시</h2>
+    <form method="post" action="/admin/queue-form" class="qform">
+      <input type="hidden" name="form_token" value="${esc(formToken)}" />
+      <select name="projectId" aria-label="프로젝트">${options}</select>
+      <input name="instruction" placeholder="이 프로젝트의 담당 창에 보낼 지시" maxlength="4000" required />
+      <button type="submit">보내기</button>
+    </form>
+  </section>`;
+}
+
+export function renderDashboard(
+  instances: (InstanceStatus | InstanceError)[],
+  options: { formToken?: string; projects?: { projectId: string; name: string }[] } = {},
+): string {
   const generated = new Date().toISOString().slice(0, 19).replace("T", " ");
   // Refresh through a meta tag rather than a script. The page is served under
   // `script-src 'self'`, which blocks inline scripts outright — the setTimeout
@@ -606,7 +737,7 @@ export function renderDashboard(instances: (InstanceStatus | InstanceError)[]): 
 <title>chatgpt2codex</title><style>${STYLE}</style></head>
 <body>
 <header><h1>chatgpt2codex</h1><span class="sub">${esc(generated)} UTC · ${DASHBOARD_REFRESH_SECONDS}초마다 갱신</span></header>
-<main>${instances.map(instanceCard).join("")}</main>
+<main>${queueForm(options.projects ?? [], options.formToken)}${instances.map(instanceCard).join("")}</main>
 </body></html>`;
 }
 

@@ -234,6 +234,69 @@ describe("lease follows the connector, not the session id", () => {
     expect(released).toBe("older");
   });
 
+  it("renews a lease that is more than half spent", async () => {
+    // A lease is a work assignment. Letting it lapse mid-task hands the
+    // project to another window while the work is still going.
+    const issuedAt = now - 20 * 60_000;
+    const nearly: Lease = {
+      projectId: "webapp",
+      leaseId: "lease_webapp",
+      projectRoot: "/w/webapp",
+      preset: "full-write",
+      issuedAt,
+      expiresAt: issuedAt + 30 * 60_000, // 10 minutes left of 30
+    };
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "mine",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: nearly,
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const written: Array<{ lease?: Lease | null }> = [];
+    const ctx = ctxWith(sessions, "mine", "client-A", (s) => written.push(s as { lease?: Lease }));
+
+    const got = await requireProjectLease(ctx, "webapp", "write");
+
+    expect(got.expiresAt).toBeGreaterThan(nearly.expiresAt);
+    expect(written).toHaveLength(1);
+    // Renewed, not reissued: the same assignment continues.
+    expect(got.leaseId).toBe(nearly.leaseId);
+  });
+
+  it("leaves a fresh lease alone rather than rewriting state on every call", async () => {
+    const fresh: Lease = {
+      projectId: "webapp",
+      leaseId: "lease_webapp",
+      projectRoot: "/w/webapp",
+      preset: "full-write",
+      issuedAt: now - 60_000,
+      expiresAt: now + 29 * 60_000,
+    };
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "mine",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: fresh,
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const written: unknown[] = [];
+    const ctx = ctxWith(sessions, "mine", "client-A", (s) => written.push(s));
+
+    const got = await requireProjectLease(ctx, "webapp", "read");
+
+    expect(got.expiresAt).toBe(fresh.expiresAt);
+    expect(written).toEqual([]);
+  });
+
   it("refuses to adopt when the store cannot release the sibling's copy", async () => {
     // Adoption is a move. The release call was optional and simply absent from
     // the context wiring, so it was skipped in silence and both sessions kept

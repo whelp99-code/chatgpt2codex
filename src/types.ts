@@ -73,6 +73,10 @@ export interface SessionSummary {
    * Two MCP sessions sharing one client id are the same connector — which is
    * how a conversation that silently rotated its session id is recognised. */
   clientId?: string;
+  /** Name the conversation gave itself when it took the project. Every
+   * ChatGPT window authenticates as one OAuth client, so this is the only
+   * thing that can tell two windows of the same connector apart. */
+  workerName?: string;
   /** Short human-facing label (`W01`, `W02`, ...). Session keys are UUIDs and
    * are unreadable in error messages and dashboards. */
   slot: string;
