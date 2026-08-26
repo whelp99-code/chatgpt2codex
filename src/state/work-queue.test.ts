@@ -121,6 +121,27 @@ describe("work that a worker never finished", () => {
     expect(await q.requeueAbandoned(30 * 60_000, later)).toEqual([]);
   });
 
+  it("does not requeue work whose project still has a live holder", async () => {
+    await q.enqueue("webapp", "still being worked");
+    await q.takeNext("webapp");
+    const later = Date.now() + 60 * 60_000;
+    // Age past the grace is not enough: a worker can keep calling tools long
+    // after delivery, and an unrelated window closing must not steal this.
+    expect(await q.requeueAbandoned(30 * 60_000, later, new Set(["webapp"]))).toEqual([]);
+    expect((await q.openItems())[0]?.status).toBe("delivered");
+  });
+
+  it("requeues old work only for projects that no longer have a holder", async () => {
+    await q.enqueue("webapp", "window closed");
+    await q.takeNext("webapp");
+    await q.enqueue("api", "other window still going");
+    await q.takeNext("api");
+    const later = Date.now() + 60 * 60_000;
+    const revived = await q.requeueAbandoned(30 * 60_000, later, new Set(["api"]));
+    expect(revived.map((i) => i.projectId)).toEqual(["webapp"]);
+    expect((await q.openItems()).find((i) => i.projectId === "api")?.status).toBe("delivered");
+  });
+
   it("keeps a failed report distinct from a successful one", async () => {
     const a = await q.enqueue("webapp", "will fail");
     await q.takeNext("webapp");
@@ -140,5 +161,21 @@ describe("work that a worker never finished", () => {
     // A manager who sees only open work cannot tell success from failure —
     // the board would empty either way.
     expect(board.map((i) => i.status).sort()).toEqual(["done", "pending"]);
+  });
+
+  it("shows whatever finished recently, not whatever was queued recently", async () => {
+    const oldest = await q.enqueue("webapp", "queued first, finished last");
+    const newer = [];
+    for (let i = 0; i < 6; i++) newer.push(await q.enqueue("webapp", `newer ${i}`));
+
+    for (let i = 0; i < 7; i++) await q.takeNext("webapp");
+    for (const item of newer) await q.report(item.id, "done", "earlier");
+    await q.report(oldest.id, "done", "just now");
+
+    const board = await q.boardItems(6);
+    // A glance at recent outcomes must include the item that actually just
+    // landed, even if it was queued before the ones that finished earlier.
+    expect(board.some((i) => i.id === oldest.id)).toBe(true);
+    expect(board.find((i) => i.id === oldest.id)?.result).toBe("just now");
   });
 });

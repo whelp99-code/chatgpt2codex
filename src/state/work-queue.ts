@@ -156,13 +156,23 @@ export class WorkQueue {
    * because delivery is one-shot no other worker will ever see it — the
    * instruction is neither done nor available. Requeuing after a grace period
    * costs a possible repeat, which is recoverable; leaving it stuck is not.
+   *
+   * Session TTL is an idle timeout for transports, not a bound on how long
+   * assigned work may run. Projects that still have a live holder are left
+   * alone even after the grace — otherwise an unrelated window closing would
+   * steal in-flight work from a worker that is still calling tools.
    */
-  async requeueAbandoned(olderThanMs: number, now: number = Date.now()): Promise<WorkItem[]> {
+  async requeueAbandoned(
+    olderThanMs: number,
+    now: number = Date.now(),
+    heldProjectIds: ReadonlySet<string> = new Set(),
+  ): Promise<WorkItem[]> {
     return this.locked(async () => {
       const file = await this.load();
       const revived: WorkItem[] = [];
       for (const item of file.items) {
         if (item.status !== "delivered") continue;
+        if (heldProjectIds.has(item.projectId)) continue;
         if (item.deliveredAt === undefined || now - item.deliveredAt < olderThanMs) continue;
         item.status = "pending";
         item.deliveredAt = undefined;
@@ -196,6 +206,7 @@ export class WorkQueue {
     const open = all.filter((i) => i.status === "pending" || i.status === "delivered");
     const finished = all
       .filter((i) => i.status === "done" || i.status === "failed")
+      .sort((a, b) => (b.completedAt ?? 0) - (a.completedAt ?? 0))
       .slice(0, recentFinished);
     return [...open, ...finished];
   }

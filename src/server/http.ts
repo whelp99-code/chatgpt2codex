@@ -442,10 +442,29 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     ctx.stateDir,
     durationFromEnv("CHATGPT2CODEX_HISTORY_RETENTION_MS", DEFAULT_RETENTION_MS),
   );
+
+  async function reclaimAbandonedWork(heldProjectIds?: ReadonlySet<string>): Promise<void> {
+    const revived = await new WorkQueue(ctx.stateDir).requeueAbandoned(
+      config.sessionTtlMs,
+      Date.now(),
+      heldProjectIds,
+    );
+    if (revived.length === 0) return;
+    await ctx.ledger.append({
+      type: "work.requeued",
+      count: revived.length,
+      projectIds: [...new Set(revived.map((i) => i.projectId))],
+    });
+  }
+
   // Startup clears whatever a previous process left behind. Those sessions did
   // not finish here, and recording them would file a batch of phantom entries
-  // every time the server restarts.
-  void ctx.store.sweepSessions?.(null);
+  // every time the server restarts. Work they were holding is also ownerless
+  // now — no previous-process transport can still be live — so try to free it.
+  void (async () => {
+    await ctx.store.sweepSessions?.(null);
+    await reclaimAbandonedWork();
+  })().catch(() => undefined);
 
   const sweepInterval = setInterval(() => {
     const now = Date.now();
@@ -461,34 +480,35 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       // Read before sweeping: once the entries are gone their slot and project
       // are gone with them, and those are the only parts worth showing.
       const before = (await ctx.store.listSessions?.()) ?? [];
-      const removed = await ctx.store.sweepSessions?.([...sessions.keys()]);
-      if (!removed || removed.length === 0) return;
+      const removed = (await ctx.store.sweepSessions?.([...sessions.keys()])) ?? [];
       const gone = new Set(removed);
-      await sessionHistory.record(
-        before
-          .filter((s) => gone.has(s.sessionKey))
-          .map((s) => ({
-            slot: s.slot,
-            projectName: s.activeProjectId,
-            lastActiveAtMs: s.lastActiveAtMs,
-          })),
-      );
-      // Which sessions the sweep reclaimed, and therefore which leases were
-      // released without anyone asking. Reconstructing that from timestamps
-      // is what made the last lease incident an inference exercise.
-      await ctx.ledger.append({ type: "session.swept", sessionKeys: removed, count: removed.length });
-
-      // The same sweep that reclaims a dead window's lease should free the
-      // work it was holding: an item handed to a window that never came back
-      // is neither finished nor available to anyone else.
-      const revived = await new WorkQueue(ctx.stateDir).requeueAbandoned(config.sessionTtlMs);
-      if (revived.length > 0) {
-        await ctx.ledger.append({
-          type: "work.requeued",
-          count: revived.length,
-          projectIds: [...new Set(revived.map((i) => i.projectId))],
-        });
+      if (removed.length > 0) {
+        await sessionHistory.record(
+          before
+            .filter((s) => gone.has(s.sessionKey))
+            .map((s) => ({
+              slot: s.slot,
+              projectName: s.activeProjectId,
+              lastActiveAtMs: s.lastActiveAtMs,
+            })),
+        );
+        // Which sessions the sweep reclaimed, and therefore which leases were
+        // released without anyone asking. Reconstructing that from timestamps
+        // is what made the last lease incident an inference exercise.
+        await ctx.ledger.append({ type: "session.swept", sessionKeys: removed, count: removed.length });
       }
+
+      // Reclaim is not tied to this tick having removed a session. A window
+      // that closed minutes ago already dropped its lease on the first sweep,
+      // well before the delivery grace; later ticks must still try, or the
+      // item stays delivered forever.
+      const held = new Set(
+        before
+          .filter((s) => !gone.has(s.sessionKey))
+          .map((s) => s.activeProjectId)
+          .filter((id): id is string => id != null),
+      );
+      await reclaimAbandonedWork(held);
     })().catch(() => undefined);
     if (
       config.idleShutdownMs !== undefined &&
