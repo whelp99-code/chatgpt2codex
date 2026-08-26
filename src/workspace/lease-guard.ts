@@ -80,6 +80,55 @@ async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<L
   return sibling.lease;
 }
 
+/**
+ * How much of a lease has to be left before a tool call renews it.
+ *
+ * A lease is a work assignment, and assignments should last as long as the
+ * work does. But renewing on every call would rewrite sessions.json for a
+ * conversation that is merely reading, so renewal waits until the lease is
+ * half spent — frequent enough that active work never lapses, rare enough
+ * that it costs one write per fifteen minutes rather than one per call.
+ */
+const RENEW_WHEN_REMAINING_BELOW = 0.5;
+
+/**
+ * Push out the expiry of a lease that is being actively used.
+ *
+ * Without this a worker loses its project mid-task at the thirty-minute mark
+ * and another window can take it — the assignment ends while the work is
+ * still going. Expiry is kept, not removed: a window that is closed and
+ * forgotten has to release the project eventually, and that only happens if
+ * inactivity still runs the clock out.
+ */
+async function renewIfStale(ctx: ToolContext, lease: Lease, clientId?: string): Promise<Lease> {
+  const now = Date.now();
+  const total = lease.expiresAt - lease.issuedAt;
+  if (total <= 0) return lease;
+  const remaining = lease.expiresAt - now;
+  if (remaining > total * RENEW_WHEN_REMAINING_BELOW) return lease;
+
+  const renewed: Lease = { ...lease, expiresAt: now + total };
+  try {
+    const session = (await ctx.store.getSession(ctx.sessionKey)) as
+      | { activeProjectId?: string | null; mode?: string }
+      | null;
+    await ctx.store.setSession(
+      {
+        activeProjectId: lease.projectId,
+        mode: (session?.mode as never) ?? "read",
+        lease: renewed,
+        clientId,
+      },
+      ctx.sessionKey,
+    );
+  } catch {
+    // A failed renewal is not a failed tool call; the lease is still valid
+    // right now and the next call will try again.
+    return lease;
+  }
+  return renewed;
+}
+
 export async function requireProjectLease(
   ctx: ToolContext,
   projectId: string,
@@ -101,6 +150,8 @@ export async function requireProjectLease(
       capability,
     });
   }
+
+  lease = await renewIfStale(ctx, lease, ctx.clientId);
 
   // Second line of defence. project_select already refuses to hand out a
   // conflicting write lease, so reaching here means state drifted — a lease

@@ -1350,6 +1350,68 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   // -------------------------------------------------------------------
 
   registerTool(
+    "project_release",
+    {
+      title: "Release the active project",
+      description:
+        "Call when work on the current project is finished so another conversation can take it. Without this the project stays assigned until its lease expires on inactivity.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Releasing project...", "Project released"),
+      inputSchema: {
+        projectId: z.string().optional(),
+        reason: z.string().optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "project_release", input, async () => {
+        const session = await loadSession(ctx);
+        const held = session.lease;
+        if (!held) {
+          return makeResult({ released: false }, "No project was held by this conversation.");
+        }
+        if (input.projectId && input.projectId !== held.projectId) {
+          throw new DomainError(
+            ErrorCode.PROJECT_NOT_FOUND,
+            `This conversation holds ${held.projectId}, not ${input.projectId}.`,
+            { held: held.projectId, requested: input.projectId },
+          );
+        }
+
+        // Release every session of this connector, not just the one that
+        // happens to be answering: a worker's lease moves between sessions on
+        // every tool call, so clearing only this one leaves the assignment
+        // alive in a sibling and the project still held.
+        const sessions = (await ctx.store.listSessions?.()) ?? [];
+        const mine = sessions.filter(
+          (s) =>
+            s.lease?.projectId === held.projectId &&
+            (ctx.clientId === undefined
+              ? s.sessionKey === ctx.sessionKey
+              : s.clientId === ctx.clientId),
+        );
+        for (const s of mine) {
+          await ctx.store.releaseSessionLease?.(s.sessionKey);
+        }
+        await saveSession(ctx, { activeProjectId: null, mode: "observe", lease: null, clientId: ctx.clientId });
+
+        await ctx.ledger
+          .append({
+            type: "project.released",
+            projectId: held.projectId,
+            reason: input.reason,
+            sessionsCleared: mine.length,
+          })
+          .catch(() => undefined);
+
+        return makeResult(
+          { released: true, projectId: held.projectId, sessionsCleared: mine.length },
+          `Released ${held.projectId}. Another conversation can now take it.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
     "project_select",
     {
       title: "Select active project",
