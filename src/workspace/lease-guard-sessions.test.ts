@@ -234,6 +234,56 @@ describe("lease follows the connector, not the session id", () => {
     expect(released).toBe("older");
   });
 
+  it("refuses to adopt when the store cannot release the sibling's copy", async () => {
+    // Adoption is a move. The release call was optional and simply absent from
+    // the context wiring, so it was skipped in silence and both sessions kept
+    // the same lease id — one connector reached thirty-four sessions all
+    // holding one project. Refusing is the safe failure.
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "older",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const ctx = ctxWith(sessions, "newer", "client-A");
+    delete (ctx.store as { releaseSessionLease?: unknown }).releaseSessionLease;
+
+    await expect(requireProjectLease(ctx, "webapp", "write")).rejects.toThrow();
+  });
+
+  it("leaves exactly one holder after adopting", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "older",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const written: Array<[unknown, string | undefined]> = [];
+    const released: string[] = [];
+    const ctx = ctxWith(
+      sessions,
+      "newer",
+      "client-A",
+      (s, key) => written.push([s, key]),
+      (k) => released.push(k),
+    );
+
+    await requireProjectLease(ctx, "webapp", "write");
+
+    expect(written.map(([, key]) => key)).toEqual(["newer"]);
+    expect(released).toEqual(["older"]);
+  });
+
   it("does not adopt a lease from a different connector", async () => {
     const sessions: SessionSummary[] = [
       {
