@@ -38,7 +38,12 @@ const ALLOWED_CAPABILITIES: Record<LeasePreset, ReadonlySet<LeaseCapability>> = 
  * adopts nothing, and a lease belonging to another connector is never touched.
  */
 async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<Lease | undefined> {
-  if (!ctx.clientId || !ctx.store.listSessions) return undefined;
+  // Adoption is a move. Without a way to release the sibling's copy both
+  // sessions would hold the same lease id, which is how one connector ended up
+  // with thirty-four sessions all claiming one project — the optional call was
+  // simply absent from the wiring and skipped in silence. Refusing to adopt is
+  // the safe failure: the caller gets LEASE_REQUIRED and re-selects.
+  if (!ctx.clientId || !ctx.store.listSessions || !ctx.store.releaseSessionLease) return undefined;
   const sessions = await ctx.store.listSessions();
   const now = Date.now();
   const sibling = sessions.find(
@@ -63,7 +68,7 @@ async function adoptSiblingLease(ctx: ToolContext, projectId: string): Promise<L
     },
     ctx.sessionKey,
   );
-  await ctx.store.releaseSessionLease?.(sibling.sessionKey);
+  await ctx.store.releaseSessionLease(sibling.sessionKey);
   await ctx.ledger
     .append({
       type: "lease.inherited",
