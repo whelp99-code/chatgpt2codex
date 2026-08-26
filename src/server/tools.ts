@@ -1367,32 +1367,48 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input) => {
       return withErrorMapping(ctx, "project_release", input, async () => {
         const session = await loadSession(ctx);
-        const held = session.lease;
-        if (!held) {
-          return makeResult({ released: false }, "No project was held by this conversation.");
-        }
-        if (input.projectId && input.projectId !== held.projectId) {
-          throw new DomainError(
-            ErrorCode.PROJECT_NOT_FOUND,
-            `This conversation holds ${held.projectId}, not ${input.projectId}.`,
-            { held: held.projectId, requested: input.projectId },
-          );
-        }
-
-        // Release every session of this connector, not just the one that
-        // happens to be answering: a worker's lease moves between sessions on
-        // every tool call, so clearing only this one leaves the assignment
-        // alive in a sibling and the project still held.
+        // The answering session is often brand-new (ChatGPT rotates the MCP
+        // session per tool call) and has no lease of its own. Look at every
+        // session of this connector before deciding nothing is held — the
+        // assignment lives on a sibling until we clear it.
         const sessions = (await ctx.store.listSessions?.()) ?? [];
         const mine = sessions.filter(
           (s) =>
-            s.lease?.projectId === held.projectId &&
+            s.lease != null &&
             (ctx.clientId === undefined
               ? s.sessionKey === ctx.sessionKey
               : s.clientId === ctx.clientId),
         );
-        for (const s of mine) {
-          await ctx.store.releaseSessionLease?.(s.sessionKey);
+        const held =
+          session.lease ??
+          mine.find((s) => (input.projectId ? s.lease?.projectId === input.projectId : true))?.lease ??
+          null;
+        if (!held) {
+          return makeResult({ released: false }, "No project was held by this conversation.");
+        }
+        if (input.projectId && session.lease && input.projectId !== session.lease.projectId) {
+          throw new DomainError(
+            ErrorCode.PROJECT_NOT_FOUND,
+            `This conversation holds ${session.lease.projectId}, not ${input.projectId}.`,
+            { held: session.lease.projectId, requested: input.projectId },
+          );
+        }
+
+        const toClear = mine.filter((s) => s.lease?.projectId === held.projectId);
+        if (toClear.length > 0) {
+          const release = ctx.store.releaseSessionLease;
+          if (!release) {
+            // Release is the other half of a move. Optional-chaining it reports
+            // success while siblings keep the project — the same silent
+            // double-holder failure adoption already refuses.
+            throw new DomainError(
+              ErrorCode.LEASE_REQUIRED,
+              "Cannot release the project because the session store cannot drop sibling leases.",
+            );
+          }
+          for (const s of toClear) {
+            await release(s.sessionKey);
+          }
         }
         await saveSession(ctx, { activeProjectId: null, mode: "observe", lease: null, clientId: ctx.clientId });
 
@@ -1401,12 +1417,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             type: "project.released",
             projectId: held.projectId,
             reason: input.reason,
-            sessionsCleared: mine.length,
+            sessionsCleared: toClear.length,
           })
           .catch(() => undefined);
 
         return makeResult(
-          { released: true, projectId: held.projectId, sessionsCleared: mine.length },
+          { released: true, projectId: held.projectId, sessionsCleared: toClear.length },
           `Released ${held.projectId}. Another conversation can now take it.`,
         );
       });

@@ -268,6 +268,75 @@ describe("lease follows the connector, not the session id", () => {
     expect(got.leaseId).toBe(nearly.leaseId);
   });
 
+  it("keeps the original TTL when a half-spent lease is renewed", async () => {
+    const ttl = 30 * 60_000;
+    const issuedAt = now - 20 * 60_000;
+    const nearly: Lease = {
+      projectId: "webapp",
+      leaseId: "lease_webapp",
+      projectRoot: "/w/webapp",
+      preset: "full-write",
+      issuedAt,
+      expiresAt: issuedAt + ttl,
+    };
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "mine",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: nearly,
+        lastActiveAtMs: now,
+        clientId: "client-A",
+      },
+    ];
+    const ctx = ctxWith(sessions, "mine", "client-A", (s) => {
+      const next = s as { lease?: Lease };
+      if (next.lease) sessions[0]!.lease = next.lease;
+    });
+
+    const first = await requireProjectLease(ctx, "webapp", "write");
+    expect(first.expiresAt - first.issuedAt).toBe(ttl);
+
+    // Half-spend the renewed lease and renew again: the span must not grow.
+    const later = Date.now();
+    first.issuedAt = later - 16 * 60_000;
+    first.expiresAt = first.issuedAt + ttl;
+    sessions[0]!.lease = first;
+
+    const second = await requireProjectLease(ctx, "webapp", "write");
+    expect(second.expiresAt - second.issuedAt).toBe(ttl);
+  });
+
+  it("refuses a write when another named window of the same connector holds the project", async () => {
+    const sessions: SessionSummary[] = [
+      {
+        sessionKey: "w1-session",
+        slot: "W01",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+        workerName: "w1",
+      },
+      {
+        sessionKey: "w2-session",
+        slot: "W02",
+        activeProjectId: "webapp",
+        mode: "edit",
+        lease: lease("webapp", "full-write"),
+        lastActiveAtMs: now,
+        clientId: "client-A",
+        workerName: "w2",
+      },
+    ];
+    const ctx = ctxWith(sessions, "w2-session", "client-A");
+    await expect(requireProjectLease(ctx, "webapp", "write")).rejects.toMatchObject({
+      code: ErrorCode.PROJECT_LOCKED,
+    });
+  });
+
   it("leaves a fresh lease alone rather than rewriting state on every call", async () => {
     const fresh: Lease = {
       projectId: "webapp",

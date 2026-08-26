@@ -120,7 +120,9 @@ async function renewIfStale(ctx: ToolContext, lease: Lease, clientId?: string): 
   const remaining = lease.expiresAt - now;
   if (remaining > total * RENEW_WHEN_REMAINING_BELOW) return lease;
 
-  const renewed: Lease = { ...lease, expiresAt: now + total };
+  // Reset issuedAt so the next cycle measures the same TTL, not the
+  // growing span from the original issue to the latest expiry.
+  const renewed: Lease = { ...lease, issuedAt: now, expiresAt: now + total };
   try {
     const session = (await ctx.store.getSession(ctx.sessionKey)) as
       | { activeProjectId?: string | null; mode?: string }
@@ -172,7 +174,18 @@ export async function requireProjectLease(
   // between two selects. Cheap enough to always re-check.
   if (capability === "write" && ctx.store.listSessions) {
     const sessions = await ctx.store.listSessions();
-    assertWritable(sessions, projectId, projectId, ctx.sessionKey, Date.now(), ctx.clientId);
+    const workerName =
+      sessions.find((s) => s.sessionKey === ctx.sessionKey)?.workerName ??
+      (session as { workerName?: string } | null)?.workerName;
+    assertWritable(
+      sessions,
+      projectId,
+      projectId,
+      ctx.sessionKey,
+      Date.now(),
+      ctx.clientId,
+      workerName,
+    );
   }
 
   return lease;
