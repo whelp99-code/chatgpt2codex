@@ -459,12 +459,18 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       const removed = await ctx.store.sweepSessions?.([...sessions.keys()]);
       if (!removed || removed.length === 0) return;
       const gone = new Set(removed);
+      // Live slots show registry.name for the same id; persist that label so
+      // a finished row does not flip to the slug once the session is swept.
+      const projects = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
+      const byId = new Map(projects.map((p) => [p.projectId, p]));
       await sessionHistory.record(
         before
           .filter((s) => gone.has(s.sessionKey))
           .map((s) => ({
             slot: s.slot,
-            projectName: s.activeProjectId,
+            projectName: s.activeProjectId
+              ? (byId.get(s.activeProjectId)?.name ?? s.activeProjectId)
+              : null,
             lastActiveAtMs: s.lastActiveAtMs,
           })),
       );
