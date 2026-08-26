@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Express, Request, Response } from "express";
 import type { SessionSummary, ToolContext } from "../types.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
+import type { SessionHistoryRecord } from "../state/session-history.js";
 
 /**
  * Owner-facing status surface: `/status.json` for machines and `/admin` for a
@@ -50,6 +51,9 @@ export interface AdminDeps {
   activity?: () => ReadonlyMap<string, number>;
   activeWindowMs?: number;
   now?: () => number;
+  /** Sessions that have finished, most recent first. Injected like `activity`
+   * so admin does not have to know where history is kept. */
+  history?: () => Promise<SessionHistoryRecord[]>;
 }
 
 export interface SlotView {
@@ -77,6 +81,8 @@ export interface InstanceStatus {
   slots: SlotView[];
   maxSlots: number;
   generatedAt: number;
+  /** Absent from peers running an older build; treated as empty. */
+  history?: SessionHistoryRecord[];
 }
 
 export interface InstanceError {
@@ -197,10 +203,20 @@ export async function localStatus(
     projectCount: projects.filter((p) => p.workspaceRoot === root).length,
   }));
 
+  // A history provider that fails must not take the dashboard with it: the
+  // live half of the page is the half that matters.
+  let history: SessionHistoryRecord[] = [];
+  try {
+    history = (await deps.history?.()) ?? [];
+  } catch {
+    history = [];
+  }
+
   return {
     instance: instanceName(ctx.stateDir),
     ok: true,
     platform: platform(),
+    history,
     workspaceRoots,
     projects: projects.map((p) => ({
       projectId: p.projectId,
@@ -370,6 +386,7 @@ tr:last-child td{border-bottom:0}
 .pill.w{color:var(--warn);border-color:#5c4813}
 .pill.r{color:var(--dim)}
 .pill.a{color:var(--ok);border-color:#1f6f34}
+.done{color:var(--dim);font-size:12px;white-space:nowrap}
 .empty{padding:16px;color:var(--dim);font-size:13px}
 .err{border-color:#5c1e1c}
 .err>h2{color:var(--err)}
@@ -420,6 +437,29 @@ function slotRows(status: InstanceStatus): string {
   return `<table><thead><tr><th>세션</th><th>상태</th><th>권한</th><th>모드</th><th>만료</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+/**
+ * Recently finished sessions.
+ *
+ * The delay is stated rather than hidden: a closed conversation is only swept
+ * once its transport is gone, so an entry can take up to the session TTL to
+ * appear. Without that line the area reads as broken for half an hour.
+ */
+function historyRow(status: InstanceStatus): string {
+  const history = status.history ?? [];
+  if (history.length === 0) {
+    return `<div class="empty">최근 완료된 작업이 없습니다.</div>`;
+  }
+  const items = history
+    .slice(0, 8)
+    .map((rec) => {
+      const at = new Date(rec.endedAt).toISOString().slice(11, 16);
+      const label = rec.projectName ? `${rec.projectName} (${rec.slot})` : `(${rec.slot})`;
+      return `<span class="done">${esc(label)} <code>${esc(at)} UTC</code></span>`;
+    })
+    .join(" &nbsp;·&nbsp; ");
+  return `<div class="empty">최근 완료 &nbsp; ${items}</div>`;
+}
+
 function instanceCard(status: InstanceStatus | InstanceError): string {
   if (!status.ok) {
     return `<section class="inst err">
@@ -443,6 +483,7 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
       <div class="tile"><div class="k">워크스페이스</div><div class="v">${status.workspaceRoots.length}</div></div>
     </div>
     ${slotRows(status)}
+    ${historyRow(status)}
     <div class="empty">${roots || "등록된 워크스페이스 루트가 없습니다."}</div>
   </section>`;
 }

@@ -17,6 +17,7 @@ import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provide
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
 import { registerAdminRoutes } from "./admin.js";
+import { SessionHistory } from "../state/session-history.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -388,6 +389,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     // Snapshot rather than the live map: the dashboard reads activity, it has
     // no business holding a handle to transport state it could mutate.
     activity: () => new Map([...sessions].map(([id, tracked]) => [id, tracked.lastActiveAtMs])),
+    history: () => sessionHistory.list(),
   });
 
   app.get("/privacy", (_req, res) => {
@@ -434,6 +436,10 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   // left in sessions.json is stale. Clearing them at startup stops a write
   // lease that outlived a crash from locking the owner out of their own
   // project until it expired.
+  const sessionHistory = new SessionHistory(ctx.stateDir);
+  // Startup clears whatever a previous process left behind. Those sessions did
+  // not finish here, and recording them would file a batch of phantom entries
+  // every time the server restarts.
   void ctx.store.sweepSessions?.(null);
 
   const sweepInterval = setInterval(() => {
@@ -446,15 +452,27 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     }
     // Keep persisted leases in step with live transports: a session that went
     // away without a clean close must not keep holding its project.
-    void Promise.resolve(ctx.store.sweepSessions?.([...sessions.keys()]))
-      .then((removed) => {
-        if (!removed || removed.length === 0) return undefined;
-        // Which sessions the sweep reclaimed, and therefore which leases were
-        // released without anyone asking. Reconstructing that from timestamps
-        // is what made the last lease incident an inference exercise.
-        return ctx.ledger.append({ type: "session.swept", sessionKeys: removed, count: removed.length });
-      })
-      .catch(() => undefined);
+    void (async () => {
+      // Read before sweeping: once the entries are gone their slot and project
+      // are gone with them, and those are the only parts worth showing.
+      const before = (await ctx.store.listSessions?.()) ?? [];
+      const removed = await ctx.store.sweepSessions?.([...sessions.keys()]);
+      if (!removed || removed.length === 0) return;
+      const gone = new Set(removed);
+      await sessionHistory.record(
+        before
+          .filter((s) => gone.has(s.sessionKey))
+          .map((s) => ({
+            slot: s.slot,
+            projectName: s.activeProjectId,
+            lastActiveAtMs: s.lastActiveAtMs,
+          })),
+      );
+      // Which sessions the sweep reclaimed, and therefore which leases were
+      // released without anyone asking. Reconstructing that from timestamps
+      // is what made the last lease incident an inference exercise.
+      await ctx.ledger.append({ type: "session.swept", sessionKeys: removed, count: removed.length });
+    })().catch(() => undefined);
     if (
       config.idleShutdownMs !== undefined &&
       config.idleShutdownMs > 0 &&
