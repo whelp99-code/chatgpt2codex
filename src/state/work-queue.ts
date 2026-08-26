@@ -149,6 +149,30 @@ export class WorkQueue {
     });
   }
 
+  /**
+   * Return work that was handed to a worker which never reported back.
+   *
+   * A window can be closed mid-task. Its item stays `delivered` forever, and
+   * because delivery is one-shot no other worker will ever see it — the
+   * instruction is neither done nor available. Requeuing after a grace period
+   * costs a possible repeat, which is recoverable; leaving it stuck is not.
+   */
+  async requeueAbandoned(olderThanMs: number, now: number = Date.now()): Promise<WorkItem[]> {
+    return this.locked(async () => {
+      const file = await this.load();
+      const revived: WorkItem[] = [];
+      for (const item of file.items) {
+        if (item.status !== "delivered") continue;
+        if (item.deliveredAt === undefined || now - item.deliveredAt < olderThanMs) continue;
+        item.status = "pending";
+        item.deliveredAt = undefined;
+        revived.push(item);
+      }
+      if (revived.length > 0) await this.persist(file);
+      return revived;
+    });
+  }
+
   async list(): Promise<WorkItem[]> {
     const file = await this.load();
     return file.items.slice().sort((a, b) => b.createdAt - a.createdAt);
@@ -157,5 +181,22 @@ export class WorkQueue {
   /** In-flight work, which is what a manager watching the board cares about. */
   async openItems(): Promise<WorkItem[]> {
     return (await this.list()).filter((i) => i.status === "pending" || i.status === "delivered");
+  }
+
+  /**
+   * Open work plus whatever finished recently.
+   *
+   * A manager who can only see what is outstanding cannot tell work that
+   * succeeded from work that failed — the board would empty either way. The
+   * finished tail is bounded because it is a glance, not a log; the audit
+   * ledger keeps the durable record.
+   */
+  async boardItems(recentFinished = 6): Promise<WorkItem[]> {
+    const all = await this.list();
+    const open = all.filter((i) => i.status === "pending" || i.status === "delivered");
+    const finished = all
+      .filter((i) => i.status === "done" || i.status === "failed")
+      .slice(0, recentFinished);
+    return [...open, ...finished];
   }
 }
