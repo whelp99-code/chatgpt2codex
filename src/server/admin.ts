@@ -28,6 +28,24 @@ const INSTANCE_NAME_FILE = "instance-name.txt";
  * answer before typing again pauses for minutes. 90s sits between the two. */
 const DEFAULT_ACTIVE_WINDOW_MS = 90_000;
 
+/**
+ * Read a duration from the environment, falling back on anything unusable.
+ *
+ * Both values this configures were picked from reasoning about how people and
+ * models pause, not from measurement, so they are the settings most likely to
+ * need adjusting on a machine that behaves differently. A typo in one of them
+ * must not be able to switch the dashboard off — `ACTIVE_WINDOW_MS=abc` is a
+ * mistake to ignore, not an instruction to treat every session as idle
+ * forever.
+ */
+export function durationFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
 /** Refresh cadence for the dashboard. Shorter than the active window so a
  * session cannot cross from working to quiet without a redraw in between. */
 const DASHBOARD_REFRESH_SECONDS = 30;
@@ -164,7 +182,9 @@ export async function localStatus(
   const projects = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
   const sessions: SessionSummary[] = (await ctx.store.listSessions?.()) ?? [];
   const now = deps.now?.() ?? Date.now();
-  const activeWindowMs = deps.activeWindowMs ?? DEFAULT_ACTIVE_WINDOW_MS;
+  const activeWindowMs =
+    deps.activeWindowMs ??
+    durationFromEnv("CHATGPT2CODEX_ACTIVE_WINDOW_MS", DEFAULT_ACTIVE_WINDOW_MS);
 
   // A provider that throws must not take the dashboard down with it; falling
   // back to the stored timestamps degrades accuracy, not availability.
