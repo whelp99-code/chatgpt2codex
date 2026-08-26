@@ -16,8 +16,8 @@ import { createServer as createMcpServer } from "./mcp-server.js";
 import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provider.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
-import { registerAdminRoutes } from "./admin.js";
-import { SessionHistory } from "../state/session-history.js";
+import { registerAdminRoutes, durationFromEnv } from "./admin.js";
+import { SessionHistory, DEFAULT_RETENTION_MS } from "../state/session-history.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -436,7 +436,10 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   // left in sessions.json is stale. Clearing them at startup stops a write
   // lease that outlived a crash from locking the owner out of their own
   // project until it expired.
-  const sessionHistory = new SessionHistory(ctx.stateDir);
+  const sessionHistory = new SessionHistory(
+    ctx.stateDir,
+    durationFromEnv("CHATGPT2CODEX_HISTORY_RETENTION_MS", DEFAULT_RETENTION_MS),
+  );
   // Startup clears whatever a previous process left behind. Those sessions did
   // not finish here, and recording them would file a batch of phantom entries
   // every time the server restarts.

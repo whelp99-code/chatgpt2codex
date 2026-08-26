@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  durationFromEnv,
   fetchPeerStatus,
   loadPeers,
   localStatus,
@@ -419,4 +420,30 @@ describe("renderDashboard", () => {
     expect(html).not.toContain("<img src=x");
     expect(html).toContain("&lt;img");
   });
+});
+
+describe("durationFromEnv", () => {
+  const KEY = "CHATGPT2CODEX_TEST_DURATION";
+  afterEach(() => {
+    delete process.env[KEY];
+  });
+
+  it("uses the fallback when unset", () => {
+    expect(durationFromEnv(KEY, 90_000)).toBe(90_000);
+  });
+
+  it("reads a valid positive integer", () => {
+    process.env[KEY] = "30000";
+    expect(durationFromEnv(KEY, 90_000)).toBe(30_000);
+  });
+
+  // A typo must not be able to switch the feature off: treating "abc" as 0
+  // would mark every session idle forever.
+  it.each(["abc", "-1", "0", "12.5", "  ", "1e999"])(
+    "falls back on unusable value %j",
+    (value) => {
+      process.env[KEY] = value;
+      expect(durationFromEnv(KEY, 90_000)).toBe(90_000);
+    },
+  );
 });

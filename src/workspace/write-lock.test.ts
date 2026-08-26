@@ -170,3 +170,73 @@ describe("cross-session write lock", () => {
     });
   });
 });
+
+/**
+ * REQ-SESS-001. Concurrent work on *different* projects already worked before
+ * any of this; these pin it so the takeover and inheritance paths added later
+ * cannot quietly widen the lock into something that serialises the whole
+ * workspace.
+ */
+describe("different projects stay independent", () => {
+  const now = 2_000_000;
+
+  function lease(projectId: string, preset: Lease["preset"]): Lease {
+    return {
+      projectId,
+      leaseId: `lease_${projectId}`,
+      projectRoot: `/w/${projectId}`,
+      preset,
+      issuedAt: now - 1000,
+      expiresAt: now + 600_000,
+    };
+  }
+
+  function session(key: string, slot: string, l: Lease | null, clientId?: string): SessionSummary {
+    return {
+      sessionKey: key,
+      slot,
+      activeProjectId: l?.projectId ?? null,
+      mode: "edit",
+      lease: l,
+      lastActiveAtMs: now,
+      clientId,
+    };
+  }
+
+  // ACCEPT-SESS-001
+  it("lets two sessions hold write leases on two different projects", () => {
+    const sessions = [session("s1", "W01", lease("webapp", "full-write"), "client-A")];
+    expect(() =>
+      assertWritable(sessions, "api", "api", "s2", now, "client-B"),
+    ).not.toThrow();
+    expect(findWriteLockHolder(sessions, "api", "s2", now)).toBeUndefined();
+  });
+
+  it("keeps them independent even for one connector working two projects", () => {
+    // Same client id must not make an unrelated project look contended.
+    const sessions = [session("s1", "W01", lease("webapp", "full-write"), "client-A")];
+    expect(() =>
+      assertWritable(sessions, "api", "api", "s2", now, "client-A"),
+    ).not.toThrow();
+  });
+
+  // ACCEPT-SESS-002
+  it("still refuses two different connectors on the same project", () => {
+    const sessions = [session("s1", "W01", lease("webapp", "full-write"), "client-A")];
+    let caught: unknown;
+    try {
+      assertWritable(sessions, "webapp", "webapp", "s2", now, "client-B");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(DomainError);
+    // The holder has to be named, or the owner cannot tell which conversation
+    // to close.
+    expect((caught as DomainError).details).toMatchObject({ heldBySlot: "W01" });
+  });
+
+  it("does not let a read lease on one project block a write on another", () => {
+    const sessions = [session("s1", "W01", lease("webapp", "read-only"), "client-A")];
+    expect(() => assertWritable(sessions, "api", "api", "s2", now, "client-B")).not.toThrow();
+  });
+});
