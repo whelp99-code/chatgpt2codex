@@ -37,6 +37,7 @@ import {
   makeLease,
 } from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
+import { WorkQueue } from "../state/work-queue.js";
 
 /** Presets that grant `write`; only these contend for the exclusive lock. */
 const WRITE_CAPABLE_PRESETS: ReadonlySet<LeasePreset> = new Set<LeasePreset>(["full-write"]);
@@ -1049,8 +1050,33 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "Call project_rules and project_status.",
               `Call goal_loop again with loopId=${loopId}, the selected projectId, maxTurns=${maxTurns}, and lastResult='project selected'.`,
             ];
+        // The manager cannot call this conversation, so queued work is handed
+        // over here — the one place a worker reliably asks what to do next.
+        // Reporting the previous item folds into the same call: the worker
+        // already sends lastResult, so no extra round trip is needed.
+        const queue = new WorkQueue(ctx.stateDir);
+        let assignment: { id: string; instruction: string } | undefined;
+        if (input.projectId) {
+          try {
+            if (input.lastResult) {
+              const inFlight = (await queue.openItems()).find(
+                (i) => i.projectId === input.projectId && i.status === "delivered",
+              );
+              if (inFlight) await queue.report(inFlight.id, "done", input.lastResult);
+            }
+            const next = await queue.takeNext(input.projectId);
+            if (next) assignment = { id: next.id, instruction: next.instruction };
+          } catch {
+            // A queue fault must not stop a worker that is mid-loop.
+          }
+        }
+
         const doneRule =
           "Stop only when the requested work is implemented and verified, a real blocker is proven, or a security/approval gate is hit.";
+        const actions = assignment
+          ? [`Assigned work from the manager: ${assignment.instruction}`, ...nextActions]
+          : nextActions;
+
         const payload = {
           loopId,
           goalPreview: input.goal ? redact(input.goal).slice(0, 1000) : undefined,
@@ -1063,7 +1089,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               turn,
               at: new Date().toISOString(),
               lastResult: input.lastResult ? redact(input.lastResult).slice(0, 1000) : undefined,
-              nextActions,
+              nextActions: actions,
             },
           ],
         };
@@ -1074,7 +1100,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             turn,
             remainingTurns,
             continueRequired: remainingTurns > 0,
-            nextActions,
+            assignedWork: assignment?.instruction,
+            nextActions: actions,
             loopRules: [
               "Do one small inspect/edit/verify batch per action round.",
               "Keep each tool call short; avoid silent long thinking turns.",
@@ -1082,7 +1109,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "This is local ChatGPT-driven tooling, not OpenAI Codex quota.",
             ],
           },
-          `Loop ${loopId} turn ${turn} ready. Execute the next action batch now, then call goal_loop again unless done or blocked.`,
+          assignment
+            ? `Loop ${loopId} turn ${turn}: the manager assigned new work. Do it, then call goal_loop again with lastResult.`
+            : `Loop ${loopId} turn ${turn} ready. Execute the next action batch now, then call goal_loop again unless done or blocked.`,
         );
       });
     },

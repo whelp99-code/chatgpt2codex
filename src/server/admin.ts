@@ -6,6 +6,7 @@ import type { Express, Request, Response } from "express";
 import type { SessionSummary, ToolContext } from "../types.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { SessionHistoryRecord } from "../state/session-history.js";
+import { WorkQueue, type WorkItem } from "../state/work-queue.js";
 
 /**
  * Owner-facing status surface: `/status.json` for machines and `/admin` for a
@@ -72,6 +73,8 @@ export interface AdminDeps {
   /** Sessions that have finished, most recent first. Injected like `activity`
    * so admin does not have to know where history is kept. */
   history?: () => Promise<SessionHistoryRecord[]>;
+  /** Work waiting for, or in flight with, each project's worker. */
+  queue?: () => Promise<WorkItem[]>;
 }
 
 export interface SlotView {
@@ -101,6 +104,8 @@ export interface InstanceStatus {
   generatedAt: number;
   /** Absent from peers running an older build; treated as empty. */
   history?: SessionHistoryRecord[];
+  /** Pending and in-flight work per project. Absent on older peers. */
+  queue?: WorkItem[];
 }
 
 export interface InstanceError {
@@ -232,11 +237,19 @@ export async function localStatus(
     history = [];
   }
 
+  let queue: WorkItem[] = [];
+  try {
+    queue = (await deps.queue?.()) ?? [];
+  } catch {
+    queue = [];
+  }
+
   return {
     instance: instanceName(ctx.stateDir),
     ok: true,
     platform: platform(),
     history,
+    queue,
     workspaceRoots,
     projects: projects.map((p) => ({
       projectId: p.projectId,
@@ -340,6 +353,55 @@ export function registerAdminRoutes(
   app.get("/status.json", async (req, res) => {
     if (!(await requireOwner(req, res))) return;
     res.json(await localStatus(ctx, options.maxSlots, options));
+  });
+
+  /**
+   * Queue work for a project's worker.
+   *
+   * The only write surface on this server that is not a tool call. It exists
+   * because a manager — a person at the dashboard or an agent holding the
+   * owner token — has no other way to reach a ChatGPT conversation: MCP only
+   * answers, so an instruction has to wait somewhere until a worker asks.
+   *
+   * Bearer-only, deliberately. The dashboard cookie is set by a top-level
+   * navigation and would make this reachable from a page the owner merely
+   * visited; requiring the header means a browser cannot be tricked into
+   * queueing work on the owner's behalf.
+   */
+  app.post("/admin/queue", async (req, res) => {
+    const header = req.header("authorization");
+    const bearer = header?.startsWith("Bearer ") ? header.slice(7).trim() : undefined;
+    if (!bearer || !(await verifyOwnerToken(ctx.stateDir, bearer))) {
+      await penalize();
+      res.status(401).json({ error: "unauthorized", error_description: "owner token required" });
+      return;
+    }
+    const body = (req.body ?? {}) as { projectId?: unknown; instruction?: unknown };
+    const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+    const instruction = typeof body.instruction === "string" ? body.instruction.trim() : "";
+    if (!projectId || !instruction) {
+      res.status(400).json({ error: "invalid_request", error_description: "projectId and instruction are required" });
+      return;
+    }
+    // Refuse unknown projects here rather than letting the work sit in a queue
+    // no worker will ever read.
+    const projects = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
+    if (!projects.some((p) => p.projectId === projectId)) {
+      res.status(404).json({ error: "unknown_project", error_description: `no project ${projectId}` });
+      return;
+    }
+    try {
+      const item = await new WorkQueue(ctx.stateDir).enqueue(projectId, instruction);
+      await ctx.ledger
+        .append({ type: "work.queued", projectId, itemId: item.id })
+        .catch(() => undefined);
+      res.status(201).json({ id: item.id, projectId: item.projectId, status: item.status });
+    } catch (err) {
+      res.status(409).json({
+        error: "queue_rejected",
+        error_description: err instanceof Error ? err.message : "could not queue work",
+      });
+    }
   });
 
   app.get("/admin", async (req, res) => {
@@ -480,6 +542,29 @@ function historyRow(status: InstanceStatus): string {
   return `<div class="empty">최근 완료 &nbsp; ${items}</div>`;
 }
 
+/**
+ * Work the manager has queued for each project's worker.
+ *
+ * Delivered items stay visible rather than disappearing on handover: an
+ * instruction that vanished the moment a worker picked it up would look
+ * identical to one that was never sent.
+ */
+function queueRow(status: InstanceStatus): string {
+  const queue = status.queue ?? [];
+  if (queue.length === 0) return "";
+  const items = queue
+    .slice(0, 8)
+    .map((item) => {
+      const cls = item.status === "delivered" ? "pill w" : "pill r";
+      const label = item.status === "delivered" ? "진행 지시됨" : "대기";
+      return `<span class="done"><span class="${cls}">${label}</span> ${esc(item.projectId)} — ${esc(
+        item.instruction.slice(0, 60),
+      )}</span>`;
+    })
+    .join(" &nbsp;·&nbsp; ");
+  return `<div class="empty">작업 지시 &nbsp; ${items}</div>`;
+}
+
 function instanceCard(status: InstanceStatus | InstanceError): string {
   if (!status.ok) {
     return `<section class="inst err">
@@ -503,6 +588,7 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
       <div class="tile"><div class="k">워크스페이스</div><div class="v">${status.workspaceRoots.length}</div></div>
     </div>
     ${slotRows(status)}
+    ${queueRow(status)}
     ${historyRow(status)}
     <div class="empty">${roots || "등록된 워크스페이스 루트가 없습니다."}</div>
   </section>`;
