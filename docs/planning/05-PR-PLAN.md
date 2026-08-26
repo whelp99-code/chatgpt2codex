@@ -356,10 +356,10 @@ Successors: PR-004
   REQ-HIST-001·002 구현 · 파일 권한 0600 확인 · 쓰기 실패가 sweep을 막지 않음(R-11 예방 4항목)
   · 시작 시 sweep이 이력을 만들지 않음 · 기존 테스트 유지
 
-[SUB 목록] DECOMPOSITION: PENDING
-  사유: 롤링 웨이브. PR-001·002가 admin.ts의 구조를 바꾼 뒤 그 결과 위에서 분해해야
-  대상 위치와 시그니처가 정확해진다. PR-002 완료 시점에 이 섹션을 SUB/DETAIL로 채운다.
-  다만 R-11(R3) 대응은 분해 전이라도 확정 사항이며 04 문서의 예방 4개 항목을 그대로 따른다.
+[SUB 목록] 완료 — PR #12 로 머지됨.
+  ADR-002(별도 파일)·ADR-003(임계 초과 시 재작성)·ADR-004(시작 시 sweep 제외) 모두 설계대로
+  구현했고, R-11 예방 4개 항목도 그대로 지켰다(record 가 스스로 예외를 삼키고, 세션 정리를
+  먼저 끝낸 뒤 이력을 쓴다). 쓰기 불가 상태에서 record 가 정상 반환하는지 테스트로 고정.
 ```
 
 ---
@@ -401,25 +401,46 @@ Successors: 없음 (인수)
   ACCEPT-SESS-001·002 통과 · 환경변수 미설정 시 기본값 동작 · 잘못된 값에서 기본값 폴백
   · 전체 테스트 통과
 
-[SUB 목록] DECOMPOSITION: PENDING
-  사유: 롤링 웨이브. PR-001·003에서 상수가 놓일 최종 위치가 정해진 뒤 분해한다.
+[SUB 목록] 완료 — PR #13 으로 머지됨.
+  ASSUMED-001·002 를 durationFromEnv 로 뺐고, 잘못된 값은 기본값으로 되돌린다(오타가 기능을
+  끄지 못하게). 동시성 회귀는 write-lock.test.ts 에 4건 추가.
 ```
 
 ---
 
 ## 요구사항 추적표
 
-| REQ | Acceptance | PR | SUB | 구현 파일 | 검증 명령 | 상태 |
-|---|---|---|---|---|---|---|
-| REQ-SESS-001 | ACCEPT-SESS-001, 002 | PR-004 | PENDING | 테스트만 (동작은 기존 코드) | `npm run build && npm test` | 계획됨 |
-| REQ-STAT-001 | ACCEPT-STAT-001, 002 | PR-001 | SUB-002 | src/server/http.ts | `npm run build && npm test` | 계획됨 |
-| REQ-STAT-002 | ACCEPT-STAT-003, 004 | PR-001 | SUB-001, 003 | src/server/admin.ts | `npm run build && npm test` | 계획됨 |
-| REQ-STAT-003 | 기본값 폴백 테스트 | PR-004 | PENDING | 설정 로딩 지점 | `npm run build && npm test` | 계획됨 |
-| REQ-NAME-001 | ACCEPT-NAME-001, 002 | PR-002 | SUB-001, 002 | src/server/admin.ts | `npm run build && npm test` | 계획됨 |
-| REQ-HIST-001 | ACCEPT-HIST-001, 002 | PR-003 | PENDING | src/state/session-history.ts, src/server/http.ts | `npm run build && npm test` | 계획됨 |
-| REQ-HIST-002 | ACCEPT-HIST-003, 004 | PR-003 | PENDING | src/state/session-history.ts, src/server/admin.ts | `npm run build && npm test` | 계획됨 |
+전 항목 완료. 상태는 머지된 PR 번호로 표시한다.
 
-## 실행 순서 요약
+| REQ | Acceptance | PR | 구현 | 검증 | 상태 |
+|---|---|---|---|---|---|
+| REQ-SESS-001 | ACCEPT-SESS-001, 002 | #13 | 기존 동작 + 회귀 테스트 4개 | `npm test` 511 통과 | ✅ 완료 |
+| REQ-STAT-001 | ACCEPT-STAT-001, 002 | #6 | `src/server/http.ts` 활동 맵 주입 | 브라우저 확인 | ✅ 완료 |
+| REQ-STAT-002 | ACCEPT-STAT-003, 004 | #6 | `src/server/admin.ts` 상태 판정 | 진행중/대기 렌더 확인 | ✅ 완료 |
+| REQ-STAT-003 | 잘못된 값 폴백 | #13 | `durationFromEnv` | 환경변수 실측 | ✅ 완료 |
+| REQ-NAME-001 | ACCEPT-NAME-001, 002 | #8 | `sessionLabel` | 브라우저 확인 | ✅ 완료 |
+| REQ-HIST-001 | ACCEPT-HIST-001, 002 | #12 | `src/state/session-history.ts` | 쓰기 불가 시 무예외 | ✅ 완료 |
+| REQ-HIST-002 | ACCEPT-HIST-003, 004 | #12 | 보존 필터 + 완료 영역 | 30일 전 레코드 제외 확인 | ✅ 완료 |
+
+## 계획 밖에서 나온 것
+
+계획은 대시보드 기능만 다뤘는데, 그 과정에서 운영을 막던 결함 여섯 개가 드러나 함께 고쳤다.
+모두 계획 문서가 예측하지 못한 것이고, 대부분 **관측 수단을 먼저 넣은 덕분에** 발견됐다.
+
+| PR | 내용 | 어떻게 드러났나 |
+|---|---|---|
+| #1 | 승인 폼 CSP가 루프백 리다이렉트를 차단 | 브라우저 콘솔 |
+| #4 | OAuth 토큰 감사 로깅 | 진단 수단이 아예 없어서 추가 |
+| #5 | refresh 로테이션 유예 — 클라이언트 자신의 병렬 재시도가 세션을 끊던 문제 | #4 배포 몇 분 만에 로그가 지목 |
+| #9 | 재연결한 커넥터가 자기 lease를 되찾도록 | 감사 로그 시간선 추론 |
+| #10 | 세션 라이프사이클 감사 로깅 | #9 진단이 추론이어야 했던 이유 |
+| #11 | lease가 세션이 아니라 커넥터를 따라가도록 | #10 배포 직후 "호출마다 새 세션" 발견 |
+
+#9는 **불충분했다**. 재연결이 가끔 일어난다고 가정했는데 실제로는 도구 호출마다였고,
+그 오판은 #10의 로그가 몇 분 만에 드러냈다. 로그를 먼저 넣지 않았다면 재발을 또 추론으로
+쫓았을 것이다.
+
+## 실행 순서 요약## 실행 순서 요약
 
 ```
 MANUAL-1 (PR #1 머지)
@@ -447,7 +468,7 @@ MANUAL-2 (맥·우분투 배포)
 |---|---|---|
 | 모호어 grep (11개 패턴) | 검출 0건 | 통과 |
 | TBD·TODO·FIXME·??? | 검출 0건 | 통과 |
-| DECOMPOSITION: PENDING | 2건 (PR-003, PR-004) | 통과 — 둘 다 롤링 웨이브 사유 기재 |
+| DECOMPOSITION: PENDING | 2건 (PR-003, PR-004) | 통과 — 둘 다 롤링 웨이브 사유 기재. 이후 #12·#13으로 분해·완료 |
 | 검증 명령 실존 대조 | 참조 3개(`npm run build`·`npm run typecheck`·`npm test`) 전부 package.json에 존재 | 통과 — 미실존 0 |
 | 빈칸 스캔 | 30건 검출 → **전부 오탐** | 통과 |
 | 행 번호 인용 대조 | 15개 인용 전수 대조 | 14개 일치, 1개 부정확 → F-003으로 수정 |
