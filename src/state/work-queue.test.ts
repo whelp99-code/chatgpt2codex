@@ -41,6 +41,31 @@ describe("work queue", () => {
     expect([a, b].filter(Boolean)).toHaveLength(1);
   });
 
+  it("serialises takes across WorkQueue instances on the same file", async () => {
+    await q.enqueue("webapp", "only once");
+    const other = new WorkQueue(dir);
+    const [a, b] = await Promise.all([q.takeNext("webapp"), other.takeNext("webapp")]);
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+  });
+
+  it("does not drop an enqueue that races another instance", async () => {
+    const other = new WorkQueue(dir);
+    await Promise.all([q.enqueue("webapp", "from a"), other.enqueue("webapp", "from b")]);
+    const open = await q.openItems();
+    expect(open).toHaveLength(2);
+    expect(open.map((i) => i.instruction).sort()).toEqual(["from a", "from b"]);
+  });
+
+  it("does not deliver a second item while one is in flight", async () => {
+    await q.enqueue("webapp", "first");
+    await q.enqueue("webapp", "second");
+    const first = await q.currentWork("webapp");
+    const again = await q.currentWork("webapp");
+    expect(first?.instruction).toBe("first");
+    expect(again?.id).toBe(first?.id);
+    expect((await q.openItems()).filter((i) => i.status === "delivered")).toHaveLength(1);
+  });
+
   it("keeps delivered work visible instead of dropping it", async () => {
     const item = await q.enqueue("webapp", "in flight");
     await q.takeNext("webapp");

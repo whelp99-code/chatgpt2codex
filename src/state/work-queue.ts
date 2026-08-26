@@ -1,4 +1,4 @@
-import { mkdir, chmod, readFile, writeFile } from "node:fs/promises";
+import { mkdir, chmod, readFile, writeFile, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
@@ -50,9 +50,16 @@ function emptyFile(): QueueFile {
   return { version: 1, updatedAt: Date.now(), items: [] };
 }
 
+/**
+ * One mutex per queue file, not per WorkQueue instance. Production callers
+ * construct a fresh WorkQueue on every admin enqueue, goal_loop handover, and
+ * dashboard read; an instance-local chain would let two objects load the same
+ * pending row and one persist would drop the other.
+ */
+const writingByPath = new Map<string, Promise<unknown>>();
+
 export class WorkQueue {
   private readonly stateDir: string;
-  private writing: Promise<unknown> = Promise.resolve();
 
   constructor(stateDir: string) {
     this.stateDir = stateDir;
@@ -72,12 +79,21 @@ export class WorkQueue {
     }
   }
 
+  /**
+   * Write to a sibling temp file, then rename over the live path so a reader
+   * never observes truncated JSON. A parse failure here is treated as an empty
+   * queue, so a mid-write read would otherwise wipe every item on the next
+   * persist.
+   */
   private async persist(file: QueueFile): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: DIR_MODE });
     file.updatedAt = Date.now();
-    await writeFile(this.path(), JSON.stringify(file, null, 2), { encoding: "utf8", mode: FILE_MODE });
+    const target = this.path();
+    const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(tmp, JSON.stringify(file, null, 2), { encoding: "utf8", mode: FILE_MODE });
+    await rename(tmp, target);
     try {
-      await chmod(this.path(), FILE_MODE);
+      await chmod(target, FILE_MODE);
     } catch {
       // Non-fatal: the filesystem may not support POSIX permission bits.
     }
@@ -86,8 +102,10 @@ export class WorkQueue {
   /** Serialise writes: a manager adding work and a worker taking it are
    * concurrent, and a lost update here silently drops an instruction. */
   private locked<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.writing.then(fn, fn);
-    this.writing = next.catch(() => undefined);
+    const key = this.path();
+    const prev = writingByPath.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    writingByPath.set(key, next.catch(() => undefined));
     return next;
   }
 
@@ -123,6 +141,32 @@ export class WorkQueue {
   async takeNext(projectId: string): Promise<WorkItem | undefined> {
     return this.locked(async () => {
       const file = await this.load();
+      const item = file.items
+        .filter((i) => i.projectId === projectId && i.status === "pending")
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (!item) return undefined;
+      item.status = "delivered";
+      item.deliveredAt = Date.now();
+      await this.persist(file);
+      return item;
+    });
+  }
+
+  /**
+   * The work this project's worker should do now: the item already in flight,
+   * or the oldest pending item (now marked delivered).
+   *
+   * lastResult on goal_loop is a batch progress report, not a completion, so a
+   * later turn must not collect another pending item while one is still
+   * delivered.
+   */
+  async currentWork(projectId: string): Promise<WorkItem | undefined> {
+    return this.locked(async () => {
+      const file = await this.load();
+      const inFlight = file.items
+        .filter((i) => i.projectId === projectId && i.status === "delivered")
+        .sort((a, b) => (a.deliveredAt ?? a.createdAt) - (b.deliveredAt ?? b.createdAt))[0];
+      if (inFlight) return inFlight;
       const item = file.items
         .filter((i) => i.projectId === projectId && i.status === "pending")
         .sort((a, b) => a.createdAt - b.createdAt)[0];

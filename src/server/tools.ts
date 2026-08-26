@@ -1052,19 +1052,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             ];
         // The manager cannot call this conversation, so queued work is handed
         // over here — the one place a worker reliably asks what to do next.
-        // Reporting the previous item folds into the same call: the worker
-        // already sends lastResult, so no extra round trip is needed.
+        // lastResult is a batch progress report, not a completion: keep the
+        // in-flight item and never deliver a second one while the first is
+        // still being worked.
         const queue = new WorkQueue(ctx.stateDir);
         let assignment: { id: string; instruction: string } | undefined;
         if (input.projectId) {
           try {
-            if (input.lastResult) {
-              const inFlight = (await queue.openItems()).find(
-                (i) => i.projectId === input.projectId && i.status === "delivered",
-              );
-              if (inFlight) await queue.report(inFlight.id, "done", input.lastResult);
-            }
-            const next = await queue.takeNext(input.projectId);
+            const next = await queue.currentWork(input.projectId);
             if (next) assignment = { id: next.id, instruction: next.instruction };
           } catch {
             // A queue fault must not stop a worker that is mid-loop.
