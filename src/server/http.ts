@@ -18,6 +18,7 @@ import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
 import { registerAdminRoutes, durationFromEnv } from "./admin.js";
 import { SessionHistory, DEFAULT_RETENTION_MS } from "../state/session-history.js";
+import { WorkQueue } from "../state/work-queue.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -390,6 +391,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     // no business holding a handle to transport state it could mutate.
     activity: () => new Map([...sessions].map(([id, tracked]) => [id, tracked.lastActiveAtMs])),
     history: () => sessionHistory.list(),
+    queue: () => new WorkQueue(ctx.stateDir).openItems(),
   });
 
   app.get("/privacy", (_req, res) => {
