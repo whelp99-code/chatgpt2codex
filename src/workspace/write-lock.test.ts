@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertWritable,
   canTakeOverWriteLock,
-  findSiblingLease,
+  findSiblingLeases,
   findVerifyPeers,
   findWriteLockHolder,
 } from "./project-select.js";
@@ -326,7 +326,7 @@ describe("worker names separate windows of one connector", () => {
  * one a lookup happened to return first, alternating between granted and
  * PERMISSION_DENIED with no visible cause.
  */
-describe("findSiblingLease sees every preset, not only write ones", () => {
+describe("findSiblingLeases sees every preset, not only write ones", () => {
   const now = 4_000_000;
 
   function lease(preset: Lease["preset"]): Lease {
@@ -340,7 +340,12 @@ describe("findSiblingLease sees every preset, not only write ones", () => {
     };
   }
 
-  function session(key: string, l: Lease | null, clientId?: string): SessionSummary {
+  function session(
+    key: string,
+    l: Lease | null,
+    clientId?: string,
+    workerName?: string,
+  ): SessionSummary {
     return {
       sessionKey: key,
       slot: key,
@@ -349,6 +354,7 @@ describe("findSiblingLease sees every preset, not only write ones", () => {
       lease: l,
       lastActiveAtMs: now,
       clientId,
+      workerName,
     };
   }
 
@@ -356,22 +362,64 @@ describe("findSiblingLease sees every preset, not only write ones", () => {
     const sessions = [session("other", lease("tests-only"), "client-A")];
     // The bug: this returned undefined, so project_select never released it.
     expect(findWriteLockHolder(sessions, "webapp", "me", now)).toBeUndefined();
-    expect(findSiblingLease(sessions, "webapp", "me", now)?.sessionKey).toBe("other");
+    expect(findSiblingLeases(sessions, "webapp", "me", now).map((s) => s.sessionKey)).toEqual([
+      "other",
+    ]);
   });
 
   it("finds a read-only sibling too", () => {
     const sessions = [session("other", lease("read-only"), "client-A")];
-    expect(findSiblingLease(sessions, "webapp", "me", now)?.sessionKey).toBe("other");
+    expect(findSiblingLeases(sessions, "webapp", "me", now).map((s) => s.sessionKey)).toEqual([
+      "other",
+    ]);
   });
 
   it("never returns the caller's own session", () => {
     const sessions = [session("me", lease("full-write"), "client-A")];
-    expect(findSiblingLease(sessions, "webapp", "me", now)).toBeUndefined();
+    expect(findSiblingLeases(sessions, "webapp", "me", now)).toEqual([]);
   });
 
   it("does not return an expired sibling lease", () => {
     const expired: Lease = { ...lease("tests-only"), expiresAt: now - 1 };
     const sessions = [session("other", expired, "client-A")];
-    expect(findSiblingLease(sessions, "webapp", "me", now)).toBeUndefined();
+    expect(findSiblingLeases(sessions, "webapp", "me", now)).toEqual([]);
+  });
+
+  it("returns every live sibling, not just the first", () => {
+    // Insertion order puts a foreign read lease first. Stopping there would
+    // hide this connector's own earlier grant — the split this consolidation
+    // exists to close.
+    const sessions = [
+      session("foreign", lease("read-only"), "client-B"),
+      session("own-a", lease("full-write"), "client-A"),
+      session("own-b", lease("tests-only"), "client-A"),
+    ];
+    expect(findSiblingLeases(sessions, "webapp", "me", now).map((s) => s.sessionKey)).toEqual([
+      "foreign",
+      "own-a",
+      "own-b",
+    ]);
+  });
+
+  it("lets the caller take over only this connector's leases when a foreign one is listed first", () => {
+    const sessions = [
+      session("foreign", lease("read-only"), "client-B"),
+      session("own", lease("full-write"), "client-A"),
+    ];
+    const takeable = findSiblingLeases(sessions, "webapp", "me", now).filter((s) =>
+      canTakeOverWriteLock(s, "client-A"),
+    );
+    expect(takeable.map((s) => s.sessionKey)).toEqual(["own"]);
+  });
+
+  it("does not treat a differently-named window as this connector's chain", () => {
+    const sessions = [
+      session("w2", lease("full-write"), "client-A", "w2"),
+      session("w1-old", lease("tests-only"), "client-A", "w1"),
+    ];
+    const takeable = findSiblingLeases(sessions, "webapp", "me", now).filter((s) =>
+      canTakeOverWriteLock(s, "client-A", "w1"),
+    );
+    expect(takeable.map((s) => s.sessionKey)).toEqual(["w1-old"]);
   });
 });

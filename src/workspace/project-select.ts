@@ -102,31 +102,35 @@ export function findWriteLockHolder(
  * two to choose from it picked whichever happened to come first, alternating
  * between granted and PERMISSION_DENIED call to call.
  *
- * This finds the sibling regardless of its preset so project_select can
- * consolidate down to one lease chain per connector no matter which preset
- * is requested. Whether to actually take it over is still gated by
- * `canTakeOverWriteLock` at the call site — this only locates the candidate.
+ * This finds every such sibling, of any preset, so project_select can
+ * drain a split chain down to one per connector. `listSessions` is
+ * insertion-ordered, so a foreign read/test lease or a differently-named
+ * window that connected first is a normal first match — returning only that
+ * one and stopping lets this connector's own earlier grant survive the
+ * re-select. Whether to actually take each over is still gated by
+ * `canTakeOverWriteLock` at the call site — this only locates the candidates.
  */
-export function findSiblingLease(
+export function findSiblingLeases(
   sessions: readonly SessionSummary[],
   projectId: string,
   selfSessionKey: string,
   now: number = Date.now(),
-): WriteLockHolder | undefined {
+): WriteLockHolder[] {
+  const found: WriteLockHolder[] = [];
   for (const session of sessions) {
     if (session.sessionKey === selfSessionKey) continue;
     const { lease } = session;
     if (!isLive(lease, projectId, now)) continue;
-    return {
+    found.push({
       slot: session.slot,
       sessionKey: session.sessionKey,
       clientId: session.clientId,
       workerName: session.workerName,
       heldSince: lease.issuedAt,
       expiresAt: lease.expiresAt,
-    };
+    });
   }
-  return undefined;
+  return found;
 }
 
 /**

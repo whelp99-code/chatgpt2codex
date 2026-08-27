@@ -33,7 +33,7 @@ function workspaceRootsOf(ctx: ToolContext): string[] {
 import {
   assertWritable,
   canTakeOverWriteLock,
-  findSiblingLease,
+  findSiblingLeases,
   makeLease,
 } from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
@@ -1523,19 +1523,35 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         // runs for every preset, not just write-capable ones — the earlier
         // check above only refuses a *different* connector; this consolidates
         // this connector's own leases down to one.
-        if (ctx.store.listSessions && ctx.store.releaseSessionLease) {
+        if (ctx.store.listSessions) {
           const sessions = await ctx.store.listSessions();
-          const sibling = findSiblingLease(sessions, entry.projectId, ctx.sessionKey);
-          if (sibling && canTakeOverWriteLock(sibling, ctx.clientId, input.workerName)) {
-            await ctx.store.releaseSessionLease(sibling.sessionKey);
-            await ctx.ledger
-              .append({
-                type: "lease.taken_over",
-                projectId: entry.projectId,
-                fromSlot: sibling.slot,
-                heldSince: sibling.heldSince,
-              })
-              .catch(() => undefined);
+          const siblings = findSiblingLeases(sessions, entry.projectId, ctx.sessionKey).filter(
+            (sibling) => canTakeOverWriteLock(sibling, ctx.clientId, input.workerName),
+          );
+          if (siblings.length > 0) {
+            const release = ctx.store.releaseSessionLease;
+            // Takeover is a MOVE. Missing release is not "nothing to consolidate":
+            // minting alongside a live sibling is how one connector ends up with
+            // two chains. Refuse and let the caller re-select — worse than a
+            // successful move, far better than two holders.
+            if (!release) {
+              throw new DomainError(
+                ErrorCode.LEASE_REQUIRED,
+                "Cannot replace this connector's existing lease without releasing the prior holder.",
+                { projectId: entry.projectId },
+              );
+            }
+            for (const sibling of siblings) {
+              await release(sibling.sessionKey);
+              await ctx.ledger
+                .append({
+                  type: "lease.taken_over",
+                  projectId: entry.projectId,
+                  fromSlot: sibling.slot,
+                  heldSince: sibling.heldSince,
+                })
+                .catch(() => undefined);
+            }
           }
         }
 
