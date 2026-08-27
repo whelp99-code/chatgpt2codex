@@ -89,6 +89,47 @@ export function findWriteLockHolder(
 }
 
 /**
+ * Any live lease a sibling session holds on this project, of any preset.
+ *
+ * `findWriteLockHolder` only sees full-write/control leases, because only
+ * those need cross-connector exclusivity. But `project_select` mints a fresh
+ * lease on every call regardless of preset, and only the write-capable branch
+ * ever released a prior holder. Selecting tests-only (or read-only, or
+ * image-only) skipped that release entirely and minted an independent lease
+ * chain that coexisted with an already-held full-write one — the same
+ * connector then had two live leases on one project. Every later tool call
+ * lands on a fresh per-call session that adopts *a* sibling lease, and with
+ * two to choose from it picked whichever happened to come first, alternating
+ * between granted and PERMISSION_DENIED call to call.
+ *
+ * This finds the sibling regardless of its preset so project_select can
+ * consolidate down to one lease chain per connector no matter which preset
+ * is requested. Whether to actually take it over is still gated by
+ * `canTakeOverWriteLock` at the call site — this only locates the candidate.
+ */
+export function findSiblingLease(
+  sessions: readonly SessionSummary[],
+  projectId: string,
+  selfSessionKey: string,
+  now: number = Date.now(),
+): WriteLockHolder | undefined {
+  for (const session of sessions) {
+    if (session.sessionKey === selfSessionKey) continue;
+    const { lease } = session;
+    if (!isLive(lease, projectId, now)) continue;
+    return {
+      slot: session.slot,
+      sessionKey: session.sessionKey,
+      clientId: session.clientId,
+      workerName: session.workerName,
+      heldSince: lease.issuedAt,
+      expiresAt: lease.expiresAt,
+    };
+  }
+  return undefined;
+}
+
+/**
  * Slots of other live sessions that can also run tests on `projectId`.
  *
  * Concurrent test runs are allowed rather than blocked — tests are re-runnable

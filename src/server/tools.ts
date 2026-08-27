@@ -33,7 +33,7 @@ function workspaceRootsOf(ctx: ToolContext): string[] {
 import {
   assertWritable,
   canTakeOverWriteLock,
-  findWriteLockHolder,
+  findSiblingLease,
   makeLease,
 } from "../workspace/project-select.js";
 import { requireProjectLease } from "../workspace/lease-guard.js";
@@ -1495,9 +1495,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             { preset },
           );
         }
-        // Writes are exclusive across sessions: refuse here, before the model
+        // Writes are exclusive across connectors: refuse here, before the model
         // starts planning edits it will not be allowed to make. Reads and test
-        // runs stay shared, so a second conversation can still inspect a
+        // runs stay shared, so a different connector can still inspect a
         // project someone else is editing.
         if (WRITE_CAPABLE_PRESETS.has(preset) && ctx.store.listSessions) {
           const sessions = await ctx.store.listSessions();
@@ -1510,19 +1510,30 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             ctx.clientId,
             input.workerName,
           );
+        }
 
-          // Past the check, a surviving holder can only be this same connector
-          // under an older session id. Take the lease off it, or the stale
-          // session and this one both believe they hold the project.
-          const holder = findWriteLockHolder(sessions, entry.projectId, ctx.sessionKey);
-          if (holder && canTakeOverWriteLock(holder, ctx.clientId, input.workerName)) {
-            await ctx.store.releaseSessionLease?.(holder.sessionKey);
+        // project_select mints a fresh lease on every call, for any preset.
+        // A live lease this same connector already holds on this project —
+        // whatever preset it was granted under — has to be replaced rather
+        // than left standing, or the connector ends up holding two lease
+        // chains at once (e.g. an earlier full-write and a later tests-only).
+        // A later tool call on a fresh per-call session would then inherit
+        // whichever chain a plain lookup happened to return first, alternating
+        // between granted and PERMISSION_DENIED with no visible cause. This
+        // runs for every preset, not just write-capable ones — the earlier
+        // check above only refuses a *different* connector; this consolidates
+        // this connector's own leases down to one.
+        if (ctx.store.listSessions && ctx.store.releaseSessionLease) {
+          const sessions = await ctx.store.listSessions();
+          const sibling = findSiblingLease(sessions, entry.projectId, ctx.sessionKey);
+          if (sibling && canTakeOverWriteLock(sibling, ctx.clientId, input.workerName)) {
+            await ctx.store.releaseSessionLease(sibling.sessionKey);
             await ctx.ledger
               .append({
                 type: "lease.taken_over",
                 projectId: entry.projectId,
-                fromSlot: holder.slot,
-                heldSince: holder.heldSince,
+                fromSlot: sibling.slot,
+                heldSince: sibling.heldSince,
               })
               .catch(() => undefined);
           }
