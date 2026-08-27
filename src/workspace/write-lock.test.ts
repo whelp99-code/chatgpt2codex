@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertWritable,
   canTakeOverWriteLock,
+  findSiblingLease,
   findVerifyPeers,
   findWriteLockHolder,
 } from "./project-select.js";
@@ -314,5 +315,63 @@ describe("worker names separate windows of one connector", () => {
     expect(() =>
       assertWritable(held(), "webapp", "webapp", "s2", now, "client-A", "w2"),
     ).not.toThrow();
+  });
+});
+
+/**
+ * Regression for a real incident: `project_select` minted a fresh lease on
+ * every call, but only full-write ever released a prior holder. Selecting
+ * tests-only after full-write left both leases alive for one connector, and
+ * later tool calls — each on a fresh per-call session — inherited whichever
+ * one a lookup happened to return first, alternating between granted and
+ * PERMISSION_DENIED with no visible cause.
+ */
+describe("findSiblingLease sees every preset, not only write ones", () => {
+  const now = 4_000_000;
+
+  function lease(preset: Lease["preset"]): Lease {
+    return {
+      projectId: "webapp",
+      leaseId: `lease_${preset}`,
+      projectRoot: "/w/webapp",
+      preset,
+      issuedAt: now - 1000,
+      expiresAt: now + 600_000,
+    };
+  }
+
+  function session(key: string, l: Lease | null, clientId?: string): SessionSummary {
+    return {
+      sessionKey: key,
+      slot: key,
+      activeProjectId: l?.projectId ?? null,
+      mode: "edit",
+      lease: l,
+      lastActiveAtMs: now,
+      clientId,
+    };
+  }
+
+  it("finds a tests-only sibling, which findWriteLockHolder cannot see", () => {
+    const sessions = [session("other", lease("tests-only"), "client-A")];
+    // The bug: this returned undefined, so project_select never released it.
+    expect(findWriteLockHolder(sessions, "webapp", "me", now)).toBeUndefined();
+    expect(findSiblingLease(sessions, "webapp", "me", now)?.sessionKey).toBe("other");
+  });
+
+  it("finds a read-only sibling too", () => {
+    const sessions = [session("other", lease("read-only"), "client-A")];
+    expect(findSiblingLease(sessions, "webapp", "me", now)?.sessionKey).toBe("other");
+  });
+
+  it("never returns the caller's own session", () => {
+    const sessions = [session("me", lease("full-write"), "client-A")];
+    expect(findSiblingLease(sessions, "webapp", "me", now)).toBeUndefined();
+  });
+
+  it("does not return an expired sibling lease", () => {
+    const expired: Lease = { ...lease("tests-only"), expiresAt: now - 1 };
+    const sessions = [session("other", expired, "client-A")];
+    expect(findSiblingLease(sessions, "webapp", "me", now)).toBeUndefined();
   });
 });
