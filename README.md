@@ -15,7 +15,8 @@ You choose the workspace, approve the token, and keep control of what gets
 edited.
 
 [Download v0.2.0](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0) ·
-[Beginner installation guide](docs/INSTALL.md)
+[Beginner installation guide](docs/INSTALL.md) ·
+[GitHub delivery tools](docs/github-delivery.md)
 
 > Help us get this in front of more builders: star the repo if you want
 > ChatGPT to stop talking about code and start safely doing the repo loop.

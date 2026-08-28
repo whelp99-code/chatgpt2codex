@@ -65,6 +65,19 @@ import {
   stopE2eServer,
 } from "../e2e/local-e2e.js";
 import { gitRepositoryStatus, gitStatus, gitDiffSummary, gitStageAndCommit, gitPush } from "../git/git.js";
+import {
+  commentOnGitHubIssue,
+  commentOnGitHubPullRequest,
+  createGitHubIssue,
+  createGitHubPullRequest,
+  getGitHubIssue,
+  getGitHubPullRequestChecks,
+  listGitHubIssues,
+  requestGitHubPullRequestReview,
+  setGitHubIssueState,
+  updateGitHubIssue,
+  updateGitHubPullRequest,
+} from "../github/github.js";
 import { resolveInProject } from "../policy/paths.js";
 import { isSecretPath, redact } from "../policy/secrets.js";
 import { resolveActiveProject } from "../workspace/active.js";
@@ -2620,6 +2633,452 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           },
           `Pushed ${result.branch} to ${result.remote}.`,
         );
+      });
+    },
+  );
+
+  // -------------------------------------------------------------------
+  // 8.7 GitHub delivery tools
+  // -------------------------------------------------------------------
+
+  registerTool(
+    "github_issue_list",
+    {
+      title: "List GitHub Issues",
+      description:
+        "List Issues for the selected project's github.com origin. The repository is derived from git origin and cannot be supplied by the caller.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Listing GitHub Issues...", "GitHub Issues listed"),
+      inputSchema: {
+        projectId: z.string(),
+        state: z.enum(["open", "closed", "all"]).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_issue_list", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "read");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const issues = await listGitHubIssues(entry.root, { state: input.state, limit: input.limit });
+        return makeResult({ issues }, `Found ${issues.length} GitHub Issue(s).`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_issue_get",
+    {
+      title: "Get GitHub Issue",
+      description: "Read one Issue, including comments, from the selected project's github.com origin.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Reading GitHub Issue...", "GitHub Issue loaded"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_issue_get", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "read");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const issue = await getGitHubIssue(entry.root, input.number);
+        return makeResult({ issue }, `GitHub Issue #${input.number} loaded.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_issue_create",
+    {
+      title: "Create GitHub Issue",
+      description:
+        "Create an Issue in the selected project's github.com origin. Requires a full-write lease; labels and assignees must already exist or be valid for that repository.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Creating GitHub Issue...", "GitHub Issue created"),
+      inputSchema: {
+        projectId: z.string(),
+        title: z.string().min(1).max(256),
+        body: z.string().max(65_536),
+        labels: z.array(z.string().min(1).max(100)).max(20).optional(),
+        assignees: z.array(z.string().min(1).max(100)).max(20).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_issue_create", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const issue = await createGitHubIssue(entry.root, input);
+        await ctx.ledger.append({
+          type: "github.issue.created",
+          projectId: input.projectId,
+          number: issue.number,
+          url: issue.url,
+        });
+        return makeResult(issue, `Created GitHub Issue #${issue.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_issue_update",
+    {
+      title: "Update GitHub Issue",
+      description:
+        "Update an Issue title/body and add or remove existing labels and assignees in the selected project's github.com origin. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Updating GitHub Issue...", "GitHub Issue updated"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+        title: z.string().min(1).max(256).optional(),
+        body: z.string().max(65_536).optional(),
+        addLabels: z.array(z.string().min(1).max(100)).max(20).optional(),
+        removeLabels: z.array(z.string().min(1).max(100)).max(20).optional(),
+        addAssignees: z.array(z.string().min(1).max(100)).max(20).optional(),
+        removeAssignees: z.array(z.string().min(1).max(100)).max(20).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_issue_update", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const result = await updateGitHubIssue(entry.root, input.number, input);
+        await ctx.ledger.append({
+          type: "github.issue.updated",
+          projectId: input.projectId,
+          number: input.number,
+        });
+        return makeResult(result, `Updated GitHub Issue #${input.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_issue_comment",
+    {
+      title: "Comment on GitHub Issue",
+      description: "Add a comment to an Issue in the selected project's github.com origin. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Commenting on GitHub Issue...", "GitHub Issue comment added"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+        body: z.string().min(1).max(65_536),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_issue_comment", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const result = await commentOnGitHubIssue(entry.root, input.number, input.body);
+        await ctx.ledger.append({
+          type: "github.issue.commented",
+          projectId: input.projectId,
+          number: input.number,
+          url: result.url,
+        });
+        return makeResult(result, `Commented on GitHub Issue #${input.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_issue_set_state",
+    {
+      title: "Close or reopen GitHub Issue",
+      description: "Close or reopen an Issue in the selected project's github.com origin. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Changing GitHub Issue state...", "GitHub Issue state changed"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+        state: z.enum(["open", "closed"]),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_issue_set_state", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const result = await setGitHubIssueState(entry.root, input.number, input.state);
+        await ctx.ledger.append({
+          type: "github.issue.state_changed",
+          projectId: input.projectId,
+          number: input.number,
+          state: input.state,
+        });
+        return makeResult(result, `Set GitHub Issue #${input.number} to ${input.state}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_pr_create",
+    {
+      title: "Create GitHub Pull Request",
+      description:
+        "Create a Pull Request from the selected project's current named branch. The head branch cannot be supplied by the caller. Does not merge. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Creating GitHub Pull Request...", "GitHub Pull Request created"),
+      inputSchema: {
+        projectId: z.string(),
+        title: z.string().min(1).max(256),
+        body: z.string().max(65_536),
+        base: z.string().min(1).max(255).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_pr_create", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const pullRequest = await createGitHubPullRequest(entry.root, input);
+        await ctx.ledger.append({
+          type: "github.pull_request.created",
+          projectId: input.projectId,
+          number: pullRequest.number,
+          url: pullRequest.url,
+        });
+        return makeResult(pullRequest, `Created GitHub Pull Request #${pullRequest.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_pr_update",
+    {
+      title: "Update GitHub Pull Request",
+      description:
+        "Update a Pull Request title or body in the selected project's github.com origin. Does not merge. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Updating GitHub Pull Request...", "GitHub Pull Request updated"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+        title: z.string().min(1).max(256).optional(),
+        body: z.string().max(65_536).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_pr_update", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const result = await updateGitHubPullRequest(entry.root, input.number, input);
+        await ctx.ledger.append({
+          type: "github.pull_request.updated",
+          projectId: input.projectId,
+          number: input.number,
+        });
+        return makeResult(result, `Updated GitHub Pull Request #${input.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_pr_comment",
+    {
+      title: "Comment on GitHub Pull Request",
+      description:
+        "Add a comment to a Pull Request in the selected project's github.com origin. Does not review or merge. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Commenting on GitHub Pull Request...", "GitHub Pull Request comment added"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+        body: z.string().min(1).max(65_536),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_pr_comment", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const result = await commentOnGitHubPullRequest(entry.root, input.number, input.body);
+        await ctx.ledger.append({
+          type: "github.pull_request.commented",
+          projectId: input.projectId,
+          number: input.number,
+          url: result.url,
+        });
+        return makeResult(result, `Commented on GitHub Pull Request #${input.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_pr_request_review",
+    {
+      title: "Request GitHub Pull Request review",
+      description:
+        "Request reviewers for a Pull Request in the selected project's github.com origin. Does not merge. Requires a full-write lease.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Requesting GitHub review...", "GitHub review requested"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+        reviewers: z.array(z.string().min(1).max(100)).min(1).max(20),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_pr_request_review", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const result = await requestGitHubPullRequestReview(entry.root, input.number, input.reviewers);
+        await ctx.ledger.append({
+          type: "github.pull_request.review_requested",
+          projectId: input.projectId,
+          number: input.number,
+          reviewers: input.reviewers,
+        });
+        return makeResult(result, `Requested review for GitHub Pull Request #${input.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_checks_get",
+    {
+      title: "Get GitHub CI checks",
+      description: "Read CI and check results for a Pull Request in the selected project's github.com origin.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Reading GitHub checks...", "GitHub checks loaded"),
+      inputSchema: {
+        projectId: z.string(),
+        number: z.number().int().positive(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_checks_get", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "read");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const checks = await getGitHubPullRequestChecks(entry.root, input.number);
+        return makeResult({ checks }, `Loaded ${checks.length} GitHub check result(s) for PR #${input.number}.`);
+      });
+    },
+  );
+
+  registerTool(
+    "github_delivery",
+    {
+      title: "GitHub delivery operations",
+      description:
+        "Bounded GitHub delivery bridge for Actions: Issue read/write/triage, current-branch PR create/update/comment/review request, and CI checks. Never merges, runs workflows, releases, or changes repository settings.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Running GitHub delivery operation...", "GitHub delivery operation completed"),
+      inputSchema: {
+        projectId: z.string(),
+        operation: z.enum([
+          "issue_list",
+          "issue_get",
+          "issue_create",
+          "issue_update",
+          "issue_comment",
+          "issue_set_state",
+          "pr_create",
+          "pr_update",
+          "pr_comment",
+          "pr_request_review",
+          "checks_get",
+        ]),
+        number: z.number().int().positive().optional(),
+        state: z.enum(["open", "closed", "all"]).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+        title: z.string().min(1).max(256).optional(),
+        body: z.string().max(65_536).optional(),
+        base: z.string().min(1).max(255).optional(),
+        labels: z.array(z.string().min(1).max(100)).max(20).optional(),
+        assignees: z.array(z.string().min(1).max(100)).max(20).optional(),
+        addLabels: z.array(z.string().min(1).max(100)).max(20).optional(),
+        removeLabels: z.array(z.string().min(1).max(100)).max(20).optional(),
+        addAssignees: z.array(z.string().min(1).max(100)).max(20).optional(),
+        removeAssignees: z.array(z.string().min(1).max(100)).max(20).optional(),
+        reviewers: z.array(z.string().min(1).max(100)).min(1).max(20).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "github_delivery", input, async () => {
+        const readOnly = input.operation === "issue_list" || input.operation === "issue_get" || input.operation === "checks_get";
+        await requireProjectLease(ctx, input.projectId, readOnly ? "read" : "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const requiredNumber = (): number => {
+          if (input.number === undefined) {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `${input.operation} requires number`);
+          }
+          return input.number;
+        };
+        const requiredTitle = (): string => {
+          if (input.title === undefined) {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `${input.operation} requires title`);
+          }
+          return input.title;
+        };
+        const requiredBody = (): string => {
+          if (input.body === undefined) {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `${input.operation} requires body`);
+          }
+          return input.body;
+        };
+
+        let result: Record<string, unknown>;
+        switch (input.operation) {
+          case "issue_list": {
+            const issues = await listGitHubIssues(entry.root, { state: input.state, limit: input.limit });
+            result = { issues };
+            break;
+          }
+          case "issue_get":
+            result = { issue: await getGitHubIssue(entry.root, requiredNumber()) };
+            break;
+          case "issue_create":
+            result = await createGitHubIssue(entry.root, {
+              title: requiredTitle(),
+              body: requiredBody(),
+              labels: input.labels,
+              assignees: input.assignees,
+            });
+            break;
+          case "issue_update":
+            result = await updateGitHubIssue(entry.root, requiredNumber(), input);
+            break;
+          case "issue_comment":
+            result = await commentOnGitHubIssue(entry.root, requiredNumber(), requiredBody());
+            break;
+          case "issue_set_state": {
+            if (input.state !== "open" && input.state !== "closed") {
+              throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "issue_set_state requires state=open or state=closed");
+            }
+            result = await setGitHubIssueState(entry.root, requiredNumber(), input.state);
+            break;
+          }
+          case "pr_create":
+            result = await createGitHubPullRequest(entry.root, {
+              title: requiredTitle(),
+              body: requiredBody(),
+              base: input.base,
+            });
+            break;
+          case "pr_update":
+            result = await updateGitHubPullRequest(entry.root, requiredNumber(), input);
+            break;
+          case "pr_comment":
+            result = await commentOnGitHubPullRequest(entry.root, requiredNumber(), requiredBody());
+            break;
+          case "pr_request_review":
+            if (!input.reviewers?.length) {
+              throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "pr_request_review requires reviewers");
+            }
+            result = await requestGitHubPullRequestReview(entry.root, requiredNumber(), input.reviewers);
+            break;
+          case "checks_get":
+            result = { checks: await getGitHubPullRequestChecks(entry.root, requiredNumber()) };
+            break;
+        }
+        if (!readOnly) {
+          await ctx.ledger.append({
+            type: "github.delivery.completed",
+            projectId: input.projectId,
+            operation: input.operation,
+            number: input.number,
+          });
+        }
+        return makeResult(result, `GitHub delivery operation ${input.operation} completed.`);
       });
     },
   );

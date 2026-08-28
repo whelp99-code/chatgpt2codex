@@ -50,6 +50,7 @@ const NETWORK_COMMAND_PATTERNS = [
   /\b(curl|wget|nc|ncat|netcat|telnet|scp|sftp|ftp|ssh)\b/i,
   /\b(npm|pnpm|yarn|bun)\s+(install|add|update)\b/i,
   /\bgit\s+(pull|fetch|clone|push)\b/i,
+  /\bgh\b/i,
 ];
 
 function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {

@@ -102,6 +102,9 @@ describe("guardShellCommand", () => {
       "git push origin main",
       "git fetch --all",
       "git clone https://example.com/repo.git",
+      "gh issue create --title test --body body",
+      "gh pr merge 123 --merge",
+      "gh api repos/example/project/issues",
     ];
 
     for (const command of networkCommands) {

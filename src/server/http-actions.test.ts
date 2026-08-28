@@ -255,6 +255,8 @@ describe("Custom GPT action bridge", () => {
     expect(body.paths["/actions/e2e-start-server"]).toBeDefined();
     expect(body.paths["/actions/e2e-run-command"]).toBeDefined();
     expect(body.paths["/actions/e2e-test-and-show-screenshot"]).toBeDefined();
+    expect(body.paths["/actions/github-delivery"]).toBeDefined();
+    expect(body.paths["/actions/github-pr-merge"]).toBeUndefined();
     expect((body.paths["/actions/e2e-test-and-show-screenshot"] as { post: { operationId: string } }).post.operationId).toBe(
       "e2e_test_and_show_screenshot",
     );

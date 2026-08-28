@@ -17,6 +17,8 @@ https://mcp.example.com/admin?token=<owner token>
 
 토큰이 맞으면 쿠키로 옮기고 주소창에서 지웁니다. 쿼리 문자열은 셸 기록과 브라우저
 기록, 중간 프록시 로그에 남기 때문입니다. 이후로는 `/admin`으로 바로 들어갑니다.
+쿠키는 기본 30일 동안 유지됩니다. 필요하면 서버 시작 환경에
+`CHATGPT2CODEX_ADMIN_COOKIE_DAYS=1`부터 `90`까지 지정할 수 있습니다.
 
 기계용 경로도 있습니다.
 

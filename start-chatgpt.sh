@@ -10,6 +10,7 @@
 #   PORT=7979
 #   CHATGPT2CODEX_EXPOSE_WEB=1            # opt-in public tunnel for ChatGPT web
 #   CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES=20   # optional explicit idle shutdown
+#   CHATGPT2CODEX_ADMIN_COOKIE_DAYS=30        # browser admin login, 1-90 days
 #   PUBLIC_HOSTNAME=your-domain.example.com   # optional stable host for web mode
 #   CHATGPT2CODEX_ACTIVE_PROJECT_ROOT=/path/to/project
 #   CLOUDFLARED_TUNNEL_TOKEN=...      # preferred if configured in Cloudflare dashboard

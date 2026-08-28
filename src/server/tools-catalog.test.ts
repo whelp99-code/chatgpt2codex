@@ -187,6 +187,55 @@ describe("tool catalog", () => {
     expect(result.structuredContent?.desktopControlModel?.join(" ")).toContain("sensitive apps");
   });
 
+  it("exposes bounded GitHub delivery tools without merge or admin operations", async () => {
+    const server = await createServer(makeCtx());
+    const tools = (
+      server as unknown as {
+        _registeredTools?: Record<
+          string,
+          {
+            annotations?: Record<string, unknown>;
+            handler?: (input: unknown) => Promise<{ structuredContent?: Record<string, unknown> }>;
+          }
+        >;
+      }
+    )._registeredTools;
+    expect(tools).toBeDefined();
+
+    const readTools = ["github_issue_list", "github_issue_get", "github_checks_get"];
+    const writeTools = [
+      "github_issue_create",
+      "github_issue_update",
+      "github_issue_comment",
+      "github_issue_set_state",
+      "github_pr_create",
+      "github_pr_update",
+      "github_pr_comment",
+      "github_pr_request_review",
+      "github_delivery",
+    ];
+    for (const name of readTools) {
+      expect(tools?.[name]?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    }
+    for (const name of writeTools) {
+      expect(tools?.[name]?.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: true,
+      });
+    }
+    expect(tools?.github_pr_merge).toBeUndefined();
+    expect(tools?.github_workflow_run).toBeUndefined();
+    expect(tools?.github_release_create).toBeUndefined();
+
+    const denied = await tools?.github_issue_create?.handler?.({
+      projectId: "project",
+      title: "No lease",
+      body: "Must fail before spawning gh",
+    });
+    expect(denied?.structuredContent).toMatchObject({ code: "LEASE_REQUIRED" });
+  });
+
   describe("ChatGPT confirm-model exposure (CHATGPT2CODEX_CONTROL_CHATGPT)", () => {
     afterEach(() => {
       delete process.env.CHATGPT2CODEX_CONTROL_CHATGPT;

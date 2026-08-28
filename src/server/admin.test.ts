@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  adminCookieMaxAgeMs,
   durationFromEnv,
   fetchPeerStatus,
   loadPeers,
@@ -446,4 +447,26 @@ describe("durationFromEnv", () => {
       expect(durationFromEnv(KEY, 90_000)).toBe(90_000);
     },
   );
+});
+
+describe("adminCookieMaxAgeMs", () => {
+  const KEY = "CHATGPT2CODEX_ADMIN_COOKIE_DAYS";
+
+  afterEach(() => {
+    delete process.env[KEY];
+  });
+
+  it("defaults to 30 days", () => {
+    expect(adminCookieMaxAgeMs()).toBe(30 * 24 * 60 * 60 * 1000);
+  });
+
+  it("accepts a configured duration from 1 to 90 days", () => {
+    process.env[KEY] = "90";
+    expect(adminCookieMaxAgeMs()).toBe(90 * 24 * 60 * 60 * 1000);
+  });
+
+  it.each(["0", "91", "1.5", "abc", ""])("falls back for invalid value %j", (value) => {
+    process.env[KEY] = value;
+    expect(adminCookieMaxAgeMs()).toBe(30 * 24 * 60 * 60 * 1000);
+  });
 });

@@ -29,6 +29,21 @@ const INSTANCE_NAME_FILE = "instance-name.txt";
  * model calling tools in sequence pauses for seconds; a person reading the
  * answer before typing again pauses for minutes. 90s sits between the two. */
 const DEFAULT_ACTIVE_WINDOW_MS = 90_000;
+const DEFAULT_ADMIN_COOKIE_DAYS = 30;
+const MAX_ADMIN_COOKIE_DAYS = 90;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Keep browser admin access convenient without allowing an accidental
+ * configuration to persist the owner credential indefinitely. */
+export function adminCookieMaxAgeMs(): number {
+  const raw = process.env.CHATGPT2CODEX_ADMIN_COOKIE_DAYS?.trim();
+  if (!raw) return DEFAULT_ADMIN_COOKIE_DAYS * DAY_MS;
+  const days = Number(raw);
+  if (!Number.isInteger(days) || days < 1 || days > MAX_ADMIN_COOKIE_DAYS) {
+    return DEFAULT_ADMIN_COOKIE_DAYS * DAY_MS;
+  }
+  return days * DAY_MS;
+}
 
 /**
  * Read a duration from the environment, falling back on anything unusable.
@@ -508,7 +523,7 @@ export function registerAdminRoutes(
         httpOnly: true,
         sameSite: "strict",
         secure: options.secureCookies,
-        maxAge: 12 * 3600 * 1000,
+        maxAge: adminCookieMaxAgeMs(),
       });
       res.redirect("/admin");
       return;
