@@ -56,10 +56,26 @@ Assert-UnderPath $PackageDir $BuildRoot
 $Npm = Get-ToolPath @("npm.cmd", "npm")
 $Tar = Get-ToolPath @("tar.exe", "tar")
 
+function Invoke-Npm([string[]]$Arguments) {
+  $saved = @{}
+  foreach ($name in @("NPM_CONFIG_ALLOW_SCRIPTS", "npm_config_allow_scripts")) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ($null -ne $value) { $saved[$name] = $value }
+    [Environment]::SetEnvironmentVariable($name, $null)
+  }
+  try {
+    Invoke-Checked $Npm $Arguments
+  } finally {
+    foreach ($entry in $saved.GetEnumerator()) {
+      [Environment]::SetEnvironmentVariable([string]$entry.Key, [string]$entry.Value)
+    }
+  }
+}
+
 Write-Host "[chatgpt2codex] installing dependencies..."
-Invoke-Checked $Npm @("install")
+Invoke-Npm @("install")
 Write-Host "[chatgpt2codex] building TypeScript..."
-Invoke-Checked $Npm @("run", "build")
+Invoke-Npm @("run", "build")
 
 if (Test-Path -LiteralPath $PackageDir) {
   Remove-Item -LiteralPath $PackageDir -Recurse -Force
@@ -80,7 +96,7 @@ Copy-Item -LiteralPath (Join-Path $Root "linux\install-linux.sh") -Destination (
 
 Push-Location $PackageDir
 try {
-  Invoke-Checked $Npm @("ci", "--omit=dev", "--ignore-scripts")
+  Invoke-Npm @("ci", "--omit=dev", "--ignore-scripts")
 } finally {
   Pop-Location
 }
@@ -129,7 +145,11 @@ $Payload = Join-Path $BuildRoot "payload-linux-x64.tar.gz"
 if (Test-Path -LiteralPath $Payload) { Remove-Item -LiteralPath $Payload -Force }
 Push-Location $PackageDir
 try {
-  Invoke-Checked $Tar @("-czf", $Payload, ".")
+  $TarArgs = @("-czf", $Payload, ".")
+  if ($IsMacOS) {
+    $TarArgs = @("--no-xattrs", "-czf", $Payload, ".")
+  }
+  Invoke-Checked $Tar $TarArgs
 } finally {
   Pop-Location
 }

@@ -179,12 +179,41 @@ describe("tool catalog", () => {
       expect.arrayContaining(["file_apply_patch", "file_create", "local_shell_run"]),
     );
     expect(result.structuredContent?.toolSurfaceMap?.verify).toEqual(
-      expect.arrayContaining(["e2e_test_and_show_screenshot", "e2e_run_command"]),
+      expect.arrayContaining(["verification_profile", "verification_run", "e2e_test_and_show_screenshot", "e2e_run_command"]),
     );
+    expect(result.structuredContent?.toolSurfaceMap?.improve).toEqual([
+      "feedback_record",
+      "skill_improvement_review",
+      "skill_improvement_propose",
+    ]);
     expect(result.structuredContent?.securityModel?.join(" ")).toContain("current-turn ChatGPT_To_Codex tool proof");
     expect(result.structuredContent?.securityModel?.join(" ")).toContain("Prompt-injection posture");
     expect(result.structuredContent?.desktopControlModel?.join(" ")).toContain("kill switch");
     expect(result.structuredContent?.desktopControlModel?.join(" ")).toContain("sensitive apps");
+  });
+
+  it("registers the verification and proposal-only improvement tools", async () => {
+    const server = await createServer(makeCtx());
+    const tools = (
+      server as unknown as {
+        _registeredTools?: Record<string, { annotations?: Record<string, unknown>; inputSchema?: { shape?: Record<string, unknown> } }>;
+      }
+    )._registeredTools;
+
+    for (const name of [
+      "verification_profile",
+      "verification_run",
+      "feedback_record",
+      "skill_improvement_review",
+      "skill_improvement_propose",
+    ]) {
+      expect(tools?.[name], name).toBeDefined();
+    }
+    expect(tools?.skill_improvement_propose?.annotations).toMatchObject({
+      destructiveHint: false,
+      openWorldHint: false,
+    });
+    expect(tools?.goal_loop?.inputSchema?.shape?.verificationRunId).toBeDefined();
   });
 
   it("exposes bounded GitHub delivery tools without merge or admin operations", async () => {

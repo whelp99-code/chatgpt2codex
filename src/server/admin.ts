@@ -8,6 +8,7 @@ import type { SessionSummary, ToolContext } from "../types.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { SessionHistoryRecord } from "../state/session-history.js";
 import { WorkQueue, type WorkItem } from "../state/work-queue.js";
+import { listSkillImprovementProposals } from "../improvement.js";
 
 /**
  * Owner-facing status surface: `/status.json` for machines and `/admin` for a
@@ -122,6 +123,17 @@ export interface InstanceStatus {
   history?: SessionHistoryRecord[];
   /** Pending and in-flight work per project. Absent on older peers. */
   queue?: WorkItem[];
+  /** Unapplied Skill improvements awaiting owner review. */
+  improvements?: ImprovementView[];
+}
+
+export interface ImprovementView {
+  proposalId: string;
+  targetProjectId: string;
+  skillPath: string;
+  summary: string;
+  status: "proposed";
+  createdAt: string;
 }
 
 export interface InstanceError {
@@ -259,6 +271,17 @@ export async function localStatus(
   } catch {
     queue = [];
   }
+  const improvements = (await listSkillImprovementProposals(ctx.stateDir, {
+    status: "proposed",
+    limit: 10,
+  })).map((proposal) => ({
+    proposalId: proposal.proposalId,
+    targetProjectId: proposal.targetProjectId,
+    skillPath: proposal.skillPath,
+    summary: proposal.summary,
+    status: "proposed" as const,
+    createdAt: proposal.createdAt,
+  }));
 
   return {
     instance: instanceName(ctx.stateDir),
@@ -266,6 +289,7 @@ export async function localStatus(
     platform: platform(),
     history,
     queue,
+    improvements,
     workspaceRoots,
     projects: projects.map((p) => ({
       projectId: p.projectId,
@@ -692,6 +716,20 @@ function queueRow(status: InstanceStatus): string {
   return `<table><thead><tr><th>상태</th><th>프로젝트</th><th>지시 / 결과</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+function improvementRow(status: InstanceStatus): string {
+  const proposals = status.improvements ?? [];
+  if (proposals.length === 0) return "";
+  const rows = proposals
+    .map((proposal) => `<tr>
+      <td><span class="pill w">검토 대기</span></td>
+      <td>${esc(proposal.targetProjectId)}</td>
+      <td><code>${esc(proposal.skillPath)}</code></td>
+      <td>${esc(proposal.summary.slice(0, 160))}</td>
+    </tr>`)
+    .join("");
+  return `<table><thead><tr><th>Skill 제안</th><th>프로젝트</th><th>파일</th><th>요약</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 function instanceCard(status: InstanceStatus | InstanceError): string {
   if (!status.ok) {
     return `<section class="inst err">
@@ -702,6 +740,7 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
 
   const active = status.slots.filter((s) => s.preset !== null).length;
   const writing = status.slots.filter((s) => s.preset === "full-write").length;
+  const improvements = status.improvements?.length ?? 0;
   const roots = status.workspaceRoots
     .map((root) => `<code>${esc(root.root)}</code> (${root.projectCount})`)
     .join(" &nbsp;·&nbsp; ");
@@ -713,9 +752,11 @@ function instanceCard(status: InstanceStatus | InstanceError): string {
       <div class="tile"><div class="k">편집 중</div><div class="v">${writing}</div></div>
       <div class="tile"><div class="k">전체 프로젝트</div><div class="v">${status.projects.length}</div></div>
       <div class="tile"><div class="k">워크스페이스</div><div class="v">${status.workspaceRoots.length}</div></div>
+      <div class="tile"><div class="k">Skill 검토</div><div class="v">${improvements}</div></div>
     </div>
     ${slotRows(status)}
     ${queueRow(status)}
+    ${improvementRow(status)}
     ${historyRow(status)}
     <div class="empty">${roots || "등록된 워크스페이스 루트가 없습니다."}</div>
   </section>`;

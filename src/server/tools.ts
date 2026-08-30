@@ -50,6 +50,20 @@ import { intakeFromClipboard, intakeFromDownload, intakeFromPath, readClipboardT
 import { fetchImageFromUrl } from "../assets/image-url.js";
 import { prepareChatGptImagesApp } from "../assets/chatgpt-images-app.js";
 import { listCommands, runCommand } from "../exec/command-runner.js";
+import { loadVerificationProfile } from "../verification/profile.js";
+import { computeVerificationDiffHash, runVerification } from "../verification/runner.js";
+import { readVerificationReport } from "../verification/report-store.js";
+import {
+  advanceGoalLoop,
+  loadGoalLoop,
+  saveGoalLoop,
+  type GoalLoopDocumentV2,
+} from "../state/goal-loop.js";
+import {
+  createSkillImprovementProposal,
+  recordFeedback,
+  reviewSkillFeedback,
+} from "../improvement.js";
 import { runLocalShell } from "../exec/local-shell.js";
 import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { addToolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
@@ -878,7 +892,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_select"],
               inspect: ["project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
               modify: ["file_apply_patch", "file_create", "local_shell_run"],
-              verify: ["command_list", "local_shell_run", "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"],
+              verify: ["verification_profile", "verification_run", "command_list", "local_shell_run", "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"],
+              improve: ["feedback_record", "skill_improvement_review", "skill_improvement_propose"],
               release: ["git_diff_summary", "git_commit", "git_push", "checkpoint_list"],
               media: ["gpt_image_2_workflow", "save_chatgpt_image_from_url", "save_image_from_url", "save_image_from_clipboard", "save_image_from_download", "save_image_from_path"],
             },
@@ -910,6 +925,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "local_shell_run for Codex-style local commands inside the selected project",
               "If the user says 'e2e 테스트하고 스크린샷 보여줘' or asks for E2E proof in one sentence, call e2e_test_and_show_screenshot immediately. It uses the active project; ChatGPT renders the captured screenshots inline through the E2E screenshot widget, and the Actions response returns inline image markdown.",
               "For UI/E2E proof: use e2e_start_server, then e2e_run_command for test commands; it captures a screenshot by default. Use e2e_open_target/e2e_open_url_screenshot/e2e_screenshot for manual visual proof. Return the screenshot path/markdown to the user.",
+              "After verification, record only user-confirmed what/why feedback. At three records for one Skill, review and propose a one-file Skill diff; apply and open a PR only after explicit approval.",
               "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
               "For GPT Image 2 requests: generate with ChatGPT's native image surface, then import the finished image with save_chatgpt_image, save_chatgpt_image_from_url, save_image_from_url, clipboard, download, or path.",
               "For device-agnostic/mobile ChatGPT images: use the ChatGPT Share/Copy Link/content URL and call save_chatgpt_image, save_chatgpt_image_from_url, or save_image_from_url.",
@@ -1032,6 +1048,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         mode: z.enum(["implement", "research", "debug", "review", "plan"]).optional(),
         maxTurns: z.number().int().min(1).max(50).optional(),
         lastResult: z.string().optional(),
+        verificationRunId: z.string().min(1).optional(),
         /** How the assigned work ended. Defaults to done — a worker that says
          * nothing is reporting an ordinary finish; one that is stuck has to
          * say so, or the manager cannot tell the two apart and will never
@@ -1044,17 +1061,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const seed = (input.goal ?? input.loopId ?? input.lastResult ?? "local coding loop").trim();
         const loopId = input.loopId?.trim() || loopIdFor(seed);
         const maxTurns = input.maxTurns ?? 12;
-        const loopFile = path.join(ctx.stateDir, "goals", `${loopId}.loop.json`);
-        let previousTurns = 0;
-        let existingTurns: unknown[] = [];
-        try {
-          const existing = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[] };
-          existingTurns = Array.isArray(existing.turns) ? existing.turns : [];
-          previousTurns = existingTurns.length;
-        } catch {
-          existingTurns = [];
-          previousTurns = 0;
-        }
+        const existing = await loadGoalLoop(ctx.stateDir, loopId);
+        const existingTurns = existing?.turns ?? [];
+        const previousTurns = existingTurns.length;
         const turn = previousTurns + 1;
         const remainingTurns = Math.max(0, maxTurns - turn);
         const nextActions = input.projectId
@@ -1110,12 +1119,19 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           ? [`Assigned work from the manager: ${assignment.instruction}`, ...nextActions]
           : nextActions;
 
-        const payload = {
+        let document: GoalLoopDocumentV2 = {
+          version: 2,
           loopId,
-          goalPreview: input.goal ? redact(input.goal).slice(0, 1000) : undefined,
-          projectId: input.projectId,
-          mode: input.mode ?? "implement",
+          goalPreview: input.goal ? redact(input.goal).slice(0, 1000) : existing?.goalPreview,
+          projectId: input.projectId ?? existing?.projectId,
+          mode: input.mode ?? existing?.mode ?? "implement",
+          phase: existing?.phase ?? "IMPLEMENTING",
           maxTurns,
+          turn,
+          latestVerificationRunId: existing?.latestVerificationRunId,
+          currentDiffHash: existing?.currentDiffHash,
+          consecutiveFailureFingerprintCount: existing?.consecutiveFailureFingerprintCount ?? 0,
+          lastFailureFingerprint: existing?.lastFailureFingerprint,
           turns: [
             ...existingTurns,
             {
@@ -1126,15 +1142,29 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             },
           ],
         };
-        await writeGoalLoop(ctx, loopId, payload);
+        if (input.verificationRunId) {
+          const projectId = input.projectId ?? existing?.projectId;
+          if (!projectId) {
+            throw new DomainError(ErrorCode.PROJECT_NOT_SELECTED, "projectId is required with verificationRunId");
+          }
+          await requireProjectLease(ctx, projectId, "verify");
+          const project = await resolveOrThrow(ctx, { projectId });
+          const report = await readVerificationReport(project.root, input.verificationRunId);
+          const currentDiffHash = await computeVerificationDiffHash(project.root);
+          document = advanceGoalLoop(document, { type: "verification", report, currentDiffHash });
+        }
+        await saveGoalLoop(ctx.stateDir, document);
+        const terminal = ["SUCCEEDED", "BLOCKED", "EXHAUSTED"].includes(document.phase);
         return makeResult(
           {
             loopId,
             turn,
             remainingTurns,
-            continueRequired: remainingTurns > 0,
+            phase: document.phase,
+            latestVerificationRunId: document.latestVerificationRunId,
+            continueRequired: remainingTurns > 0 && !terminal,
             assignedWork: assignment?.instruction,
-            nextActions: actions,
+            nextActions: terminal ? [] : actions,
             loopRules: [
               "Do one small inspect/edit/verify batch per action round.",
               "Keep each tool call short; avoid silent long thinking turns.",
@@ -1142,9 +1172,150 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "This is local ChatGPT-driven tooling, not OpenAI Codex quota.",
             ],
           },
-          assignment
+          terminal
+            ? `Loop ${loopId} finished with phase ${document.phase}.`
+            : assignment
             ? `Loop ${loopId} turn ${turn}: the manager assigned new work. Do it, then call goal_loop again with lastResult, and lastOutcome=failed or blocked if it did not finish.`
             : `Loop ${loopId} turn ${turn} ready. Execute the next action batch now, then call goal_loop again unless done or blocked.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "verification_profile",
+    {
+      title: "Load project verification profile",
+      description:
+        "Discover the project's safe typecheck/build/test commands and load its optional .chatgpt2codex/verification.json profile.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Loading verification profile...", "Verification profile loaded"),
+      inputSchema: {
+        projectId: z.string().min(1),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "verification_profile", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "read");
+        const project = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const commands = await listCommands(project.root);
+        const profile = await loadVerificationProfile(project.root, commands.map((command) => command.commandId));
+        return makeResult({ projectId: project.projectId, profile }, "Verification profile loaded.");
+      });
+    },
+  );
+
+  registerTool(
+    "verification_run",
+    {
+      title: "Run project verification profile",
+      description:
+        "Run the selected project's discovered typecheck/build/test profile, optional local scenarios, and persist a diff-bound report.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Running project verification...", "Project verification finished"),
+      inputSchema: {
+        projectId: z.string().min(1),
+        attempt: z.number().int().min(1).max(5).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "verification_run", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "verify");
+        const project = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const commands = await listCommands(project.root);
+        const profile = await loadVerificationProfile(project.root, commands.map((command) => command.commandId));
+        const report = await runVerification(project.root, project.projectId, profile, input.attempt ?? 1);
+        return makeResult(
+          {
+            ...report,
+            evidencePath: report.evidencePath,
+          },
+          `Verification ${report.runId}: ${report.verdict}.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "feedback_record",
+    {
+      title: "Record confirmed agent feedback",
+      description:
+        "Record a user's explicit what-went-wrong and why-it-was-wrong correction for one Skill. Never infer or store whole conversation text.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Recording confirmed feedback...", "Confirmed feedback recorded"),
+      inputSchema: {
+        projectId: z.string().min(1),
+        loopId: z.string().min(1),
+        skillPath: z.string().min(1),
+        whatWentWrong: z.string().min(1).max(1000),
+        whyItWasWrong: z.string().min(1).max(1000),
+        evidenceIds: z.array(z.string().min(1)).min(1).max(20),
+        confirmedByUser: z.literal(true),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "feedback_record", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "read");
+        await resolveOrThrow(ctx, { projectId: input.projectId });
+        const feedback = await recordFeedback(ctx.stateDir, input);
+        return makeResult({ feedback }, `Feedback ${feedback.feedbackId} recorded.`);
+      });
+    },
+  );
+
+  registerTool(
+    "skill_improvement_review",
+    {
+      title: "Review repeated Skill feedback",
+      description:
+        "Group confirmed feedback for one Skill and report whether the three-record improvement threshold is ready.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Reviewing Skill feedback...", "Skill feedback reviewed"),
+      inputSchema: {
+        projectId: z.string().min(1),
+        skillPath: z.string().min(1),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "skill_improvement_review", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "read");
+        await resolveOrThrow(ctx, { projectId: input.projectId });
+        const review = await reviewSkillFeedback(ctx.stateDir, input);
+        return makeResult(review, review.ready ? "Skill feedback is ready for a proposal." : "More confirmed feedback is required.");
+      });
+    },
+  );
+
+  registerTool(
+    "skill_improvement_propose",
+    {
+      title: "Create an unapplied Skill improvement proposal",
+      description:
+        "Store a one-SKILL.md, at-most-120-line unified diff proposal from three confirmed records. This never edits, commits, pushes, or merges.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Creating Skill improvement proposal...", "Skill improvement proposal created"),
+      inputSchema: {
+        targetProjectId: z.string().min(1),
+        skillPath: z.string().min(1),
+        baseHash: z.string().regex(/^[a-f0-9]{64}$/),
+        supportingFeedbackIds: z.array(z.string().min(1)).min(1).max(20),
+        contradictingFeedbackIds: z.array(z.string().min(1)).max(20).optional(),
+        summary: z.string().min(1).max(1000),
+        unifiedDiff: z.string().min(1).max(100_000),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "skill_improvement_propose", { ...input, unifiedDiff: "[diff redacted]" }, async () => {
+        await requireProjectLease(ctx, input.targetProjectId, "read");
+        const project = await resolveOrThrow(ctx, { projectId: input.targetProjectId });
+        const proposal = await createSkillImprovementProposal(ctx.stateDir, project.root, {
+          ...input,
+          contradictingFeedbackIds: input.contradictingFeedbackIds ?? [],
+        });
+        return makeResult(
+          { proposal },
+          `Proposal ${proposal.proposalId} stored without changing the Skill or Git working tree.`,
         );
       });
     },

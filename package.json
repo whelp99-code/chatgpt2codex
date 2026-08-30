@@ -26,7 +26,7 @@
     "windows:portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-app.ps1",
     "windows:install": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1",
     "windows:e2e": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e-windows-installer.ps1",
-    "linux:package": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-linux-installer.ps1",
+    "linux:package": "pwsh -NoProfile -File scripts/build-linux-installer.ps1",
     "linux:e2e": "bash scripts/e2e-linux-installer.sh",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

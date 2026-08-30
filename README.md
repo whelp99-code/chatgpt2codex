@@ -6,7 +6,7 @@
 
 **Give ChatGPT real local coding hands.**
 
-ChatGPT To Codex is a local MCP and Actions runtime for macOS and Windows that lets ChatGPT
+ChatGPT To Codex is a local MCP and Actions runtime for macOS, Windows, and Linux that lets ChatGPT
 work inside the project folder you choose: read files, search code, apply
 patches, run tests, launch E2E checks, and send back screenshot proof.
 
@@ -79,6 +79,8 @@ project:
 - return inline screenshot previews through Actions
 - save generated image assets into the repo
 - summarize diffs, blockers, and verification evidence
+- discover and run a project verification profile, then bind completion to the current diff
+- retain user-confirmed what/why feedback and propose a bounded Skill improvement after three records
 
 The standout workflow is:
 
@@ -91,6 +93,27 @@ such as Tauri apps, it can open the built app window and capture top/middle/bott
 views. The one-shot `e2e_test_and_show_screenshot` action returns inline
 `imageMarkdown` results so you can inspect the screen without digging through
 local folders.
+
+## Verify, Repair, Improve
+
+The `verification_profile` tool discovers safe project commands such as
+`typecheck`, `build`, and `test`. `verification_run` executes them in order,
+stores a diff-bound report under `.chatgpt2codex/verification/`, and returns
+the result to `goal_loop`.
+
+```text
+implement -> verify -> repair -> verify -> succeed
+```
+
+After the work, `feedback_record` stores only a user's confirmed description
+of what was wrong and why. When one Skill has three confirmed records,
+`skill_improvement_review` can group the repeated reasons and
+`skill_improvement_propose` can store a one-`SKILL.md`, at-most-120-line
+proposal.
+
+The proposal does not edit the Skill or Git working tree. Applying it,
+committing it, pushing it, and opening a pull request remain separate,
+explicitly approved actions. Merge stays human-controlled.
 
 ## Install In 5 Minutes
 
@@ -123,6 +146,20 @@ Windows short version:
 6. Copy the `/mcp` Connector URL and approve it in ChatGPT with the Owner Token.
 
 Keep the Owner Token private. Treat it like a password.
+
+Ubuntu developer installation:
+
+```bash
+git clone https://github.com/whelp99-code/chatgpt2codex.git
+cd chatgpt2codex
+bash linux/install-ubuntu.sh
+npm run chatgpt:linux
+```
+
+The verification and improvement stores use Node filesystem APIs and the same
+project confinement on macOS and Ubuntu. Screenshot scenarios remain
+platform-specific; command, HTTP, goal-loop, feedback, and proposal checks are
+cross-platform.
 
 ## First Prompt To Try
 

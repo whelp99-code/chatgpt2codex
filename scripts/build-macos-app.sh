@@ -172,7 +172,8 @@ bundle_cloudflared
 
 (
   cd "$RUNTIME_DIR"
-  npm ci --omit=dev --ignore-scripts --prefer-offline
+  env -u npm_config_allow_scripts -u NPM_CONFIG_ALLOW_SCRIPTS \
+    npm ci --omit=dev --ignore-scripts --prefer-offline
 )
 find "$RUNTIME_DIR/node_modules" -name '*.map' -type f -delete
 find "$RUNTIME_DIR/node_modules" -name '*.ts' ! -name '*.d.ts' -type f -delete

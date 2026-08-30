@@ -371,6 +371,27 @@ describe("renderDashboard", () => {
     expect(html).toContain("최근 완료된 작업이 없습니다");
   });
 
+  it("renders unapplied Skill proposals for owner review", () => {
+    const html = renderDashboard([
+      status({
+        improvements: [
+          {
+            proposalId: "sip-1",
+            targetProjectId: "webapp",
+            skillPath: ".agents/skills/testing/SKILL.md",
+            summary: "Require direct CLI verification",
+            status: "proposed",
+            createdAt: new Date(0).toISOString(),
+          },
+        ],
+      }),
+    ]);
+
+    expect(html).toContain("Skill 검토");
+    expect(html).toContain("Require direct CLI verification");
+    expect(html).toContain(".agents/skills/testing/SKILL.md");
+  });
+
   it("counts only leased slots as active", () => {
     const html = renderDashboard([
       status({

@@ -91,23 +91,22 @@ case "$PREFIX" in
 esac
 
 stop_existing() {
-  if command -v pgrep >/dev/null 2>&1; then
-    local pids
-    pids="$(pgrep -f "$PREFIX" || true)"
-    if [ -n "$pids" ]; then
-      echo "$pids" | while read -r pid; do
-        [ -z "$pid" ] && continue
-        [ "$pid" = "$$" ] && continue
-        kill "$pid" 2>/dev/null || true
-      done
-      sleep 1
-      echo "$pids" | while read -r pid; do
-        [ -z "$pid" ] && continue
-        [ "$pid" = "$$" ] && continue
-        kill -9 "$pid" 2>/dev/null || true
-      done
-    fi
-  fi
+  local pids="" proc pid cmdline
+  for proc in /proc/[0-9]*; do
+    [ -r "$proc/cmdline" ] || continue
+    pid="${proc##*/}"
+    [ "$pid" = "$$" ] && continue
+    cmdline="$(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
+    case " $cmdline " in
+      *" $PREFIX/bin/node "*|*" $PREFIX/start-chatgpt2codex.sh "*|*" $PREFIX/chatgpt2codex "*)
+        pids="$pids $pid"
+        ;;
+    esac
+  done
+  [ -n "${pids// /}" ] || return 0
+  for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+  sleep 1
+  for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
 }
 
 link_bin() {
