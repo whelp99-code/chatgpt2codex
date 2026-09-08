@@ -98,7 +98,13 @@ fi
 
 # ------------------------------------------------------------------- install
 say "installing to $PREFIX"
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/c2c-install.XXXXXX")"
+# Default to a user-owned cache dir rather than the shared /tmp: on a host
+# running several other agents/tools, /tmp fills up under one shared-account
+# quota and a copy of a few MB of dist can fail with EDQUOT even though df
+# reports plenty of free space. $HOME/.cache is ours alone.
+staging_root="${TMPDIR:-$HOME/.cache/chatgpt2codex}"
+mkdir -p "$staging_root"
+tmp="$(mktemp -d "$staging_root/c2c-install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/app"
