@@ -175,6 +175,10 @@ export interface ToolContext {
    * desktop-control tools are exposed to ChatGPT
    * (src/control/policy.ts isControlChatGptExposed). */
   remote?: boolean;
+  /** HTTP-only, process-local owner approval channel for local_shell_run. */
+  shellApprovals?: import("./policy/shell-approvals.js").ShellApprovalStore;
+  shellApprovalUrl?: (approvalId: string) => string;
+  shellApprovalAction?: boolean;
 }
 
 // ---------------------------------------------------------------------------

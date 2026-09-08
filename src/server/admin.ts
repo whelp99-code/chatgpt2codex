@@ -9,6 +9,8 @@ import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { SessionHistoryRecord } from "../state/session-history.js";
 import { WorkQueue, type WorkItem } from "../state/work-queue.js";
 import { listSkillImprovementProposals } from "../improvement.js";
+import type { ShellApprovalStore } from "../policy/shell-approvals.js";
+import { redact } from "../policy/secrets.js";
 
 /**
  * Owner-facing status surface: `/status.json` for machines and `/admin` for a
@@ -23,6 +25,7 @@ import { listSkillImprovementProposals } from "../improvement.js";
 
 const PEERS_FILE = "peers.txt";
 const ADMIN_COOKIE = "c2c_admin";
+const LOCAL_APPROVAL_COOKIE = "c2c_local_approval";
 const PEER_TIMEOUT_MS = 4000;
 const INSTANCE_NAME_FILE = "instance-name.txt";
 
@@ -92,6 +95,8 @@ export interface AdminDeps {
   history?: () => Promise<SessionHistoryRecord[]>;
   /** Work waiting for, or in flight with, each project's worker. */
   queue?: () => Promise<WorkItem[]>;
+  shellApprovals?: ShellApprovalStore;
+  localApprovalPort?: number;
 }
 
 export interface SlotView {
@@ -373,8 +378,23 @@ function presentedToken(req: Request): string | undefined {
   if (header?.startsWith("Bearer ")) return header.slice(7).trim();
   const cookie = parseCookies(req.header("cookie"))[ADMIN_COOKIE];
   if (cookie) return cookie;
+  const localCookie = parseCookies(req.header("cookie"))[LOCAL_APPROVAL_COOKIE];
+  if (localCookie) return localCookie;
   const query = req.query?.token;
   return typeof query === "string" ? query : undefined;
+}
+
+function ownerCookie(req: Request): string | undefined {
+  return parseCookies(req.header("cookie"))[LOCAL_APPROVAL_COOKIE];
+}
+
+function isLocalApprovalRequest(req: Request, port: number | undefined): boolean {
+  const remote = req.socket.remoteAddress;
+  const host = req.header("host") ?? "";
+  if (req.header("x-forwarded-for") || req.header("x-forwarded-host") || req.header("forwarded")) return false;
+  if (remote !== "127.0.0.1" && remote !== "::1" && remote !== "::ffff:127.0.0.1") return false;
+  const expectedPort = String(port && port > 0 ? port : req.socket.localPort ?? "");
+  return /^(127\.0\.0\.1|localhost|\[::1\]):\d+$/u.test(host) && host.endsWith(`:${expectedPort}`);
 }
 
 /**
@@ -432,6 +452,48 @@ export function registerAdminRoutes(
   app.get("/status.json", async (req, res) => {
     if (!(await requireOwner(req, res))) return;
     res.json(await localStatus(ctx, options.maxSlots, options));
+  });
+
+  app.get("/admin/shell-approvals/:approvalId", async (req, res) => {
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Referrer-Policy", "same-origin");
+    if (!isLocalApprovalRequest(req, options.localApprovalPort)) { res.status(403).type("html").send(noticePage("로컬 loopback 브라우저에서만 승인할 수 있습니다.")); return; }
+    const candidate = presentedToken(req);
+    if (!candidate || !(await verifyOwnerToken(ctx.stateDir, candidate))) { await penalize(); res.status(401).type("html").send(shellApprovalLoginHtml(String(req.params.approvalId))); return; }
+    if (!ownerCookie(req)) {
+      res.cookie?.(LOCAL_APPROVAL_COOKIE, candidate, { httpOnly: true, sameSite: "strict", secure: false, maxAge: adminCookieMaxAgeMs() });
+      res.redirect(`/admin/shell-approvals/${encodeURIComponent(String(req.params.approvalId))}`);
+      return;
+    }
+    const record = options.shellApprovals?.getPending(String(req.params.approvalId));
+    if (!record) { res.status(404).type("html").send(noticePage("승인이 없거나 만료되었습니다.")); return; }
+    res.type("html").send(shellApprovalPage(record));
+  });
+
+  app.post("/admin/shell-approvals/:approvalId/login", urlencoded({ extended: false, limit: "16kb" }), async (req, res) => {
+    res.setHeader("Referrer-Policy", "same-origin");
+    if (!isLocalApprovalRequest(req, options.localApprovalPort) || !req.is("application/x-www-form-urlencoded") || req.header("origin") !== `http://${req.header("host")}`) { res.status(403).type("html").send(noticePage("로컬 브라우저 양식만 사용할 수 있습니다.")); return; }
+    const token = typeof (req.body as Record<string, unknown> | undefined)?.owner_token === "string" ? String((req.body as Record<string, unknown>).owner_token) : "";
+    if (!token || !(await verifyOwnerToken(ctx.stateDir, token))) { await penalize(); res.status(401).type("html").send(shellApprovalLoginHtml(String(req.params.approvalId))); return; }
+    res.cookie?.(LOCAL_APPROVAL_COOKIE, token, { httpOnly: true, sameSite: "strict", secure: false, maxAge: adminCookieMaxAgeMs() });
+    res.redirect(`/admin/shell-approvals/${encodeURIComponent(String(req.params.approvalId))}`);
+  });
+
+  app.post("/admin/shell-approvals/:approvalId", urlencoded({ extended: false, limit: "16kb" }), async (req, res) => {
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Referrer-Policy", "same-origin");
+    if (!isLocalApprovalRequest(req, options.localApprovalPort) || !req.is("application/x-www-form-urlencoded") || req.header("origin") !== `http://${req.header("host")}`) { res.status(403).type("html").send(noticePage("로컬 브라우저 양식만 승인할 수 있습니다.")); return; }
+    const candidate = ownerCookie(req);
+    if (!candidate || !(await verifyOwnerToken(ctx.stateDir, candidate))) { await penalize(); res.status(401).type("html").send(loginHtml()); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const approved = body.decision === "approve";
+    if ((body.decision !== "approve" && body.decision !== "deny") || !options.shellApprovals?.decide(String(req.params.approvalId), typeof body.challenge === "string" ? body.challenge : "", approved)) {
+      res.status(403).type("html").send(noticePage("승인이 이미 사용되었거나 요청과 일치하지 않습니다.")); return;
+    }
+    await ctx.ledger.append({ type: "shell_approval.decided", approvalId: String(req.params.approvalId), decision: approved ? "approved" : "denied" }).catch(() => undefined);
+    res.type("html").send(noticePage(approved ? "명령을 승인했습니다. 정확히 같은 요청을 다시 실행하세요." : "명령을 거부했습니다."));
   });
 
   /**
@@ -561,6 +623,7 @@ export function registerAdminRoutes(
       renderDashboard(instances, {
         formToken: issueFormToken(),
         projects: projects.map((p) => ({ projectId: p.projectId, name: p.name })),
+        shellApprovals: options.shellApprovals?.pending().map((record) => ({ approvalId: record.approvalId, projectId: record.projectId, url: `http://127.0.0.1:${options.localApprovalPort}/admin/shell-approvals/${record.approvalId}` })) ?? [],
       }),
     );
   });
@@ -775,6 +838,17 @@ function noticePage(message: string): string {
 </section></main></body></html>`;
 }
 
+function shellApprovalPage(record: import("../policy/shell-approvals.js").ShellApprovalRecord): string {
+  const risks = [record.inferredNetwork && "network command detected", record.declaredWritesWorkspace && "workspace write declared", record.declaredNeedsNetwork && "network declared", record.declaredDestructive && "destructive declared"].filter(Boolean).join(", ") || "none";
+  const command = redact(record.command);
+  return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>로컬 Shell 승인</title><style>${STYLE}</style></head><body><main><section class="inst"><h2>로컬 Shell 명령 승인</h2><div class="empty"><p><strong>프로젝트:</strong> ${esc(record.projectId)}</p><p><strong>작업 디렉터리:</strong> ${esc(record.cwd)}</p><p><strong>제한 시간:</strong> ${esc(record.timeoutSec)}초</p><p><strong>위험:</strong> ${esc(risks)}</p><pre>${esc(command)}</pre><form method="post" action="/admin/shell-approvals/${esc(record.approvalId)}"><input type="hidden" name="challenge" value="${esc(record.approveChallenge)}"><button type="submit" name="decision" value="approve">한 번 승인</button></form><form method="post" action="/admin/shell-approvals/${esc(record.approvalId)}"><input type="hidden" name="challenge" value="${esc(record.denyChallenge)}"><button type="submit" name="decision" value="deny">거부</button></form></div></section></main></body></html>`;
+}
+
+function shellApprovalLinks(items: { approvalId: string; projectId: string; url: string }[]): string {
+  if (items.length === 0) return "";
+  return `<section class="inst"><h2>대기 중인 로컬 shell 승인</h2><div class="empty">${items.map((item) => `<a href="${esc(item.url)}">${esc(item.projectId)} 승인 열기</a>`).join("<br>")}</div></section>`;
+}
+
 function queueForm(projects: { projectId: string; name: string }[], formToken?: string): string {
   if (!formToken || projects.length === 0) return "";
   const options = projects
@@ -793,7 +867,7 @@ function queueForm(projects: { projectId: string; name: string }[], formToken?: 
 
 export function renderDashboard(
   instances: (InstanceStatus | InstanceError)[],
-  options: { formToken?: string; projects?: { projectId: string; name: string }[] } = {},
+  options: { formToken?: string; projects?: { projectId: string; name: string }[]; shellApprovals?: { approvalId: string; projectId: string; url: string }[] } = {},
 ): string {
   const generated = new Date().toISOString().slice(0, 19).replace("T", " ");
   // Refresh through a meta tag rather than a script. The page is served under
@@ -806,7 +880,7 @@ export function renderDashboard(
 <title>chatgpt2codex</title><style>${STYLE}</style></head>
 <body>
 <header><h1>chatgpt2codex</h1><span class="sub">${esc(generated)} UTC · ${DASHBOARD_REFRESH_SECONDS}초마다 갱신</span></header>
-<main>${queueForm(options.projects ?? [], options.formToken)}${instances.map(instanceCard).join("")}</main>
+<main>${shellApprovalLinks(options.shellApprovals ?? [])}${queueForm(options.projects ?? [], options.formToken)}${instances.map(instanceCard).join("")}</main>
 </body></html>`;
 }
 
@@ -817,4 +891,8 @@ function loginHtml(): string {
 <main><section class="inst"><h2>인증 필요</h2>
 <div class="empty">오너 토큰이 필요합니다. <code>/admin?token=&lt;owner token&gt;</code> 로 여시면
 토큰은 쿠키로 옮겨지고 주소창에서 지워집니다.</div></section></main></body></html>`;
+}
+
+function shellApprovalLoginHtml(approvalId: string): string {
+  return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>로컬 승인 로그인</title><style>${STYLE}</style></head><body><main><section class="inst"><h2>오너 인증 필요</h2><form method="post" action="/admin/shell-approvals/${esc(approvalId)}/login"><label>오너 토큰 <input name="owner_token" type="password" autocomplete="one-time-code" required></label><button type="submit">로컬 승인 페이지 열기</button></form></section></main></body></html>`;
 }

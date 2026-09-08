@@ -64,7 +64,7 @@ import {
   recordFeedback,
   reviewSkillFeedback,
 } from "../improvement.js";
-import { runLocalShell } from "../exec/local-shell.js";
+import { guardShellSafety, inferNetworkCommand, issueNetworkApprovalEvidence, prepareLocalShell, runLocalShell, runPreparedLocalShell } from "../exec/local-shell.js";
 import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { addToolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
 import {
@@ -188,7 +188,7 @@ function mapError(err: unknown): ToolResult<{ error: string; code: string; detai
   if (err instanceof DomainError) {
     const safeMessage = redact(err.message);
     return makeResult(
-      { error: safeMessage, code: err.code, details: redactUnknown(err.details) },
+      { error: safeMessage, code: err.code, details: err.code === ErrorCode.APPROVAL_REQUIRED ? err.details : redactUnknown(err.details) },
       `Error [${err.code}]: ${safeMessage}`,
       true,
     );
@@ -2143,6 +2143,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         command: z.string(),
         cwd: z.string().optional(),
         timeoutSec: z.number().int().positive().max(900).optional(),
+        approvalId: z.string().uuid().optional(),
+        approvalResumeToken: z.string().optional(),
         intent: z
           .object({
             reason: z.string().optional(),
@@ -2154,19 +2156,56 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       },
     },
     async (input) => {
-      return withErrorMapping(ctx, "local_shell_run", input, async () => {
-        await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
-        if (input.intent?.needsNetwork || input.intent?.destructive) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This local shell request requires explicit approval");
-        }
+      return withErrorMapping(ctx, "local_shell_run", { ...input, approvalResumeToken: input.approvalResumeToken ? "[REDACTED]" : undefined }, async () => {
+        // Secret and OS-destructive commands are never approvable. Do this
+        // before creating a pending request so no owner page suggests otherwise.
+        guardShellSafety(input.command);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const lease = await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
+        const prepared = await prepareLocalShell(entry.root, input.cwd, input.timeoutSec);
+        const inferredNetwork = inferNetworkCommand(input.command);
+        const needsApproval = inferredNetwork || input.intent?.needsNetwork === true || input.intent?.destructive === true;
+        let evidence: { approvalId: string } | undefined;
+        if (!needsApproval && input.approvalId) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "approvalId cannot be used after changing a request to remove approval-required intent.");
+        }
+        if (needsApproval) {
+          if (!ctx.shellApprovals || !ctx.shellApprovalUrl) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is unavailable for this non-HTTP session; retry through the HTTP MCP server.");
+          }
+          const binding = {
+            command: input.command, root: prepared.root, cwd: prepared.cwd, timeoutSec: prepared.timeoutSec,
+            declaredWritesWorkspace: input.intent?.writesWorkspace === true,
+            declaredNeedsNetwork: input.intent?.needsNetwork === true, declaredDestructive: input.intent?.destructive === true,
+            inferredNetwork, sessionKey: ctx.sessionKey, clientId: ctx.clientId, projectId: input.projectId, leaseId: lease.leaseId,
+          };
+          if (input.approvalId && ctx.shellApprovals.consumeApproved(input.approvalId, binding, input.approvalResumeToken)) {
+            evidence = issueNetworkApprovalEvidence(input.approvalId);
+            await ctx.ledger.append({ type: "shell_approval.consumed", approvalId: input.approvalId, projectId: input.projectId });
+          } else if (input.approvalId) {
+            const pending = ctx.shellApprovals.getPendingForRetry(input.approvalId, binding, input.approvalResumeToken);
+            if (pending) {
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is still pending.", {
+                approvalId: pending.approvalId, expiresAt: pending.expiresAt, approvalUrl: ctx.shellApprovalUrl(pending.approvalId),
+              });
+            }
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "approvalId is expired, denied, consumed, or does not match this exact request.");
+          } else {
+            const requested = ctx.shellApprovals.request(binding, ctx.shellApprovalAction === true);
+            const pending = requested.record;
+            await ctx.ledger.append({ type: "shell_approval.requested", approvalId: pending.approvalId, projectId: input.projectId });
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is required before this local shell request can run.", {
+              approvalId: pending.approvalId, expiresAt: pending.expiresAt, approvalUrl: ctx.shellApprovalUrl(pending.approvalId), ...(requested.resumeToken ? { approvalResumeToken: requested.resumeToken } : {}),
+            });
+          }
+        }
         await ctx.ledger.append({
           type: "process.started",
           projectId: input.projectId,
           command: redact(input.command),
           shell: true,
         });
-        const result = await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec);
+        const result = await runPreparedLocalShell(prepared, input.command, evidence);
         await ctx.ledger.append({
           type: "process.output.redacted",
           projectId: input.projectId,

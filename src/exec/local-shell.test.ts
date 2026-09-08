@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DomainError, ErrorCode } from "../types.js";
-import { guardShellCommand, runLocalShell } from "./local-shell.js";
+import { guardShellCommand, issueNetworkApprovalEvidence, runLocalShell } from "./local-shell.js";
 
 /**
  * local_shell_run is an arbitrary-shell tool (exec() over /bin/sh -c) gated
@@ -164,5 +164,11 @@ describe("runLocalShell", () => {
     await expect(runLocalShell(root, "rm -rf *", undefined, 10)).rejects.toMatchObject({
       code: ErrorCode.APPROVAL_REQUIRED,
     });
+  });
+
+  it("does not let network approval bypass secret or OS-destructive guards", async () => {
+    const evidence = issueNetworkApprovalEvidence("approved-once");
+    await expect(runLocalShell(root, "cat ~/.aws/credentials", undefined, 10, evidence)).rejects.toMatchObject({ code: ErrorCode.SECRET_BLOCKED });
+    await expect(runLocalShell(root, "rm -rf *", undefined, 10, evidence)).rejects.toMatchObject({ code: ErrorCode.APPROVAL_REQUIRED });
   });
 });

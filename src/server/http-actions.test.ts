@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { storeOwnerToken } from "../auth/owner-token.js";
 import type { Lease, ToolContext } from "../types.js";
-import { createHttpServer, defaultHttpServerConfig } from "./http.js";
+import { createHttpServer, defaultHttpServerConfig, type RunningHttpServer } from "./http.js";
 
 const OWNER_TOKEN = "unit-test-owner-token-123456";
 
@@ -33,7 +33,7 @@ async function getFreePort(): Promise<number> {
   return port;
 }
 
-async function startApp(ctx: ToolContext): Promise<{ baseUrl: string; stop(): Promise<void> }> {
+async function startApp(ctx: ToolContext): Promise<{ baseUrl: string; running: RunningHttpServer; stop(): Promise<void> }> {
   const port = await getFreePort();
   const running = createHttpServer(
     ctx,
@@ -48,6 +48,7 @@ async function startApp(ctx: ToolContext): Promise<{ baseUrl: string; stop(): Pr
 
   return {
     baseUrl: `http://127.0.0.1:${port}`,
+    running,
     async stop() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -943,5 +944,96 @@ describe("Custom GPT action bridge", () => {
     const loopFile = path.join(stateDir, "goals", `${first.structuredContent.loopId}.loop.json`);
     const loopState = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[] };
     expect(loopState.turns).toHaveLength(2);
+  });
+
+  it("serves the owner-only one-use shell approval page with a decision-bound CSRF challenge", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const binding = {
+      command: "curl https://example.test", root: projectRoot, cwd: projectRoot, timeoutSec: 60,
+      declaredWritesWorkspace: false, declaredNeedsNetwork: false, declaredDestructive: false, inferredNetwork: true,
+      sessionKey: "session-a", clientId: "client-a", projectId: "proj", leaseId: "lease-a",
+    };
+    const pending = server.running.shellApprovals.request(binding).record;
+    const pagePath = `/admin/shell-approvals/${pending.approvalId}`;
+    const anonymous = await fetch(`${server.baseUrl}${pagePath}`);
+    expect(anonymous.status).toBe(401);
+
+    const login = await fetch(`${server.baseUrl}${pagePath}?token=${OWNER_TOKEN}`, { redirect: "manual" });
+    expect(login.status).toBe(302);
+    const cookie = login.headers.get("set-cookie")?.split(";")[0];
+    expect(cookie).toBeTruthy();
+    const pageRes = await fetch(`${server.baseUrl}${pagePath}`, { headers: { cookie: String(cookie) } });
+    expect(pageRes.status).toBe(200);
+    expect(pageRes.headers.get("referrer-policy")).toBe("same-origin");
+    const page = await pageRes.text();
+    expect(page).toContain("curl https://example.test");
+    const challenge = page.match(/name="challenge" value="([^"]+)"/u)?.[1];
+    expect(challenge).toBeTruthy();
+    const approve = await fetch(`${server.baseUrl}${pagePath}`, {
+      method: "POST", headers: { cookie: String(cookie), origin: server.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ challenge: String(challenge), decision: "approve" }).toString(),
+    });
+    expect(approve.status).toBe(200);
+    expect(server.running.shellApprovals.consumeApproved(pending.approvalId, { ...binding, sessionKey: "session-b" })).toBe(false);
+    expect(server.running.shellApprovals.consumeApproved(pending.approvalId, binding)).toBe(true);
+    const replay = await fetch(`${server.baseUrl}${pagePath}`, {
+      method: "POST", headers: { cookie: String(cookie), origin: server.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ challenge: String(challenge), decision: "approve" }).toString(),
+    });
+    expect(replay.status).toBe(403);
+    const tunneled = await fetch(`${server.baseUrl}${pagePath}`, { headers: { cookie: String(cookie), "x-forwarded-for": "203.0.113.1" } });
+    expect(tunneled.status).toBe(403);
+    const json = await fetch(`${server.baseUrl}${pagePath}`, { method: "POST", headers: { authorization: `Bearer ${OWNER_TOKEN}`, "content-type": "application/json" }, body: "{}" });
+    expect(json.status).toBe(403);
+  });
+
+  it("returns a loopback owner approval recovery URL from both Actions shell routes", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    await postAction(server.baseUrl, "/actions/project-select", { projectId: "proj", reason: "shell approval fixture" });
+    const direct = await postAction(server.baseUrl, "/actions/local-shell-run", { projectId: "proj", command: "curl https://example.test" });
+    const directBody = (await direct.json()) as { ok: boolean; structuredContent: { code?: string; details?: { approvalUrl?: string } } };
+    expect(directBody.ok).toBe(false);
+    expect(directBody.structuredContent.code).toBe("APPROVAL_REQUIRED");
+    expect(directBody.structuredContent.details?.approvalUrl).toContain("http://127.0.0.1:");
+    const bridged = await postAction(server.baseUrl, "/actions/call-tool", { toolName: "local_shell_run", input: { projectId: "proj", command: "curl https://example.test" } });
+    const bridgedBody = (await bridged.json()) as { ok: boolean; structuredContent: { code?: string; details?: { approvalUrl?: string } } };
+    expect(bridgedBody.ok).toBe(false);
+    expect(bridgedBody.structuredContent.code).toBe("APPROVAL_REQUIRED");
+    expect(bridgedBody.structuredContent.details?.approvalUrl).toContain("http://127.0.0.1:");
+  });
+
+  it("executes one approved Actions shell retry and rejects missing-token and replay retries", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    await postAction(server.baseUrl, "/actions/project-select", { projectId: "proj", reason: "shell resume" });
+    const first = await postAction(server.baseUrl, "/actions/local-shell-run", { projectId: "proj", command: "curl --version" });
+    const pending = (await first.json()) as { ok: boolean; structuredContent: { details?: { approvalId?: string; approvalResumeToken?: string } } };
+    const approvalId = pending.structuredContent.details?.approvalId;
+    const resumeToken = pending.structuredContent.details?.approvalResumeToken;
+    expect(pending.ok).toBe(false);
+    expect(approvalId).toBeTruthy();
+    expect(resumeToken).toBeTruthy();
+
+    const missing = await postAction(server.baseUrl, "/actions/local-shell-run", { projectId: "proj", command: "curl --version", approvalId });
+    expect((await missing.json() as { ok: boolean }).ok).toBe(false);
+    const approvalPath = `/admin/shell-approvals/${approvalId}`;
+    const login = await fetch(`${server.baseUrl}${approvalPath}?token=${OWNER_TOKEN}`, { redirect: "manual" });
+    const cookie = login.headers.get("set-cookie")?.split(";")[0];
+    const page = await fetch(`${server.baseUrl}${approvalPath}`, { headers: { cookie: String(cookie) } });
+    const challenge = (await page.text()).match(/name="challenge" value="([^"]+)"/u)?.[1];
+    const approved = await fetch(`${server.baseUrl}${approvalPath}`, { method: "POST", headers: { cookie: String(cookie), origin: server.baseUrl, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ challenge: String(challenge), decision: "approve" }).toString() });
+    expect(approved.status).toBe(200);
+
+    const wrong = await postAction(server.baseUrl, "/actions/local-shell-run", { projectId: "proj", command: "curl --version", approvalId, approvalResumeToken: "wrong" });
+    expect((await wrong.json() as { ok: boolean }).ok).toBe(false);
+    const success = await postAction(server.baseUrl, "/actions/local-shell-run", { projectId: "proj", command: "curl --version", approvalId, approvalResumeToken: resumeToken });
+    const successBody = (await success.json()) as { ok: boolean; structuredContent: { exitCode?: number; stdoutSummary?: string } };
+    expect(successBody.ok).toBe(true);
+    expect(successBody.structuredContent.exitCode).toBe(0);
+    expect(successBody.structuredContent.stdoutSummary).toContain("curl");
+    const replay = await postAction(server.baseUrl, "/actions/local-shell-run", { projectId: "proj", command: "curl --version", approvalId, approvalResumeToken: resumeToken });
+    expect((await replay.json() as { ok: boolean }).ok).toBe(false);
   });
 });

@@ -19,6 +19,7 @@ import { registerActionRoutes } from "./actions.js";
 import { registerAdminRoutes, durationFromEnv } from "./admin.js";
 import { SessionHistory, DEFAULT_RETENTION_MS } from "../state/session-history.js";
 import { WorkQueue } from "../state/work-queue.js";
+import { ShellApprovalStore } from "../policy/shell-approvals.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -247,11 +248,15 @@ function unknownClientPage(clientId: string, origin: string): string {
 export interface RunningHttpServer {
   app: Express;
   config: HttpServerConfig;
+  /** Exposed for the local owner-page integration fixture; never persisted. */
+  shellApprovals: ShellApprovalStore;
   close(): void;
 }
 
 export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): RunningHttpServer {
   const publicUrl = new URL(config.publicUrl);
+  const shellApprovals = new ShellApprovalStore();
+  const localApprovalOrigin = `http://127.0.0.1:${config.port}`;
   const mcpUrl = new URL("/mcp", publicUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
 
@@ -392,6 +397,8 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     activity: () => new Map([...sessions].map(([id, tracked]) => [id, tracked.lastActiveAtMs])),
     history: () => sessionHistory.list(),
     queue: () => new WorkQueue(ctx.stateDir).boardItems(),
+    shellApprovals,
+    localApprovalPort: config.port,
   });
 
   app.get("/privacy", (_req, res) => {
@@ -409,7 +416,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       );
   });
 
-  registerActionRoutes(app, ctx, publicUrl);
+  registerActionRoutes(app, { ...ctx, sessionKey: ctx.sessionKey ?? STDIO_SESSION_KEY, shellApprovals, shellApprovalAction: true, shellApprovalUrl: (approvalId) => `${localApprovalOrigin}/admin/shell-approvals/${approvalId}` }, publicUrl);
 
   // Per-session transport map with TTL + hard cap (NFR-03/SR-09): every
   // initialize request creates one transport, keyed by MCP session id.
@@ -588,6 +595,8 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         const authClientId = req.auth?.clientId;
         const sessionScopedCtx: ToolContext = {
           ...ctx,
+          shellApprovals,
+          shellApprovalUrl: (approvalId) => `${localApprovalOrigin}/admin/shell-approvals/${approvalId}`,
           remote: true,
           clientId: authClientId,
           // Stamp every event this session emits with who emitted it. Done
@@ -625,6 +634,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   return {
     app,
     config,
+    shellApprovals,
     close: () => {
       if (closed) return;
       closed = true;

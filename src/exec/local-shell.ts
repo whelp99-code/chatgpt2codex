@@ -53,6 +53,21 @@ const NETWORK_COMMAND_PATTERNS = [
   /\bgh\b/i,
 ];
 
+export interface LocalShellPreparation { root: string; cwd: string; timeoutSec: number }
+export interface NetworkApprovalEvidence { readonly approvalId: string }
+const issuedNetworkApprovalEvidence = new WeakSet<object>();
+
+/** Internal capability issued only after a matching approval record is consumed. */
+export function issueNetworkApprovalEvidence(approvalId: string): NetworkApprovalEvidence {
+  const evidence = { approvalId };
+  issuedNetworkApprovalEvidence.add(evidence);
+  return evidence;
+}
+
+export function inferNetworkCommand(command: string): boolean {
+  return NETWORK_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
+}
+
 function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
   const limit = OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES;
   if (buf.length <= limit) {
@@ -66,7 +81,7 @@ function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
   };
 }
 
-export function guardShellCommand(command: string): void {
+export function guardShellSafety(command: string): void {
   for (const pattern of SECRET_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
       throw new DomainError(
@@ -89,8 +104,12 @@ export function guardShellCommand(command: string): void {
   // the declared intent, the actual authority for network/egress commands:
   // reject them here unconditionally, matching how a declared needsNetwork
   // is already always rejected by the caller.
+}
+
+export function guardShellCommand(command: string, evidence?: NetworkApprovalEvidence): void {
+  guardShellSafety(command);
   for (const pattern of NETWORK_COMMAND_PATTERNS) {
-    if (pattern.test(command)) {
+    if (pattern.test(command) && (!evidence || !issuedNetworkApprovalEvidence.has(evidence as object))) {
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
         "local_shell_run blocked a network/egress command that requires explicit approval",
@@ -99,11 +118,20 @@ export function guardShellCommand(command: string): void {
   }
 }
 
+export async function prepareLocalShell(root: string, cwd?: string, timeoutSec?: number): Promise<LocalShellPreparation> {
+  const baseRoot = await fs.realpath(root);
+  const commandCwd = cwd ? await resolveInProject(baseRoot, cwd, { allowSymlink: false }) : baseRoot;
+  const stat = await fs.stat(commandCwd).catch(() => null);
+  if (!stat?.isDirectory()) throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "cwd is not a project directory", { cwd });
+  return { root: baseRoot, cwd: commandCwd, timeoutSec: Math.min(Math.max(timeoutSec ?? DEFAULT_TIMEOUT_SEC, 1), MAX_TIMEOUT_SEC) };
+}
+
 export async function runLocalShell(
   root: string,
   command: string,
   cwd?: string,
   timeoutSec?: number,
+  evidence?: NetworkApprovalEvidence,
 ): Promise<{
   cwd: string;
   exitCode: number;
@@ -112,21 +140,16 @@ export async function runLocalShell(
   durationMs: number;
   outputTruncated: boolean;
 }> {
-  guardShellCommand(command);
+  return runPreparedLocalShell(await prepareLocalShell(root, cwd, timeoutSec), command, evidence);
+}
 
-  const baseRoot = await fs.realpath(root);
-  const commandCwd = cwd
-    ? await resolveInProject(baseRoot, cwd, { allowSymlink: false })
-    : baseRoot;
-  const stat = await fs.stat(commandCwd).catch(() => null);
-  if (!stat?.isDirectory()) {
-    throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "cwd is not a project directory", {
-      cwd,
-    });
-  }
-
-  const requestedTimeout = timeoutSec ?? DEFAULT_TIMEOUT_SEC;
-  const effectiveTimeoutSec = Math.min(Math.max(requestedTimeout, 1), MAX_TIMEOUT_SEC);
+export async function runPreparedLocalShell(
+  prepared: LocalShellPreparation, command: string, evidence?: NetworkApprovalEvidence,
+): Promise<{ cwd: string; exitCode: number; stdoutSummary: string; stderrSummary: string; durationMs: number; outputTruncated: boolean }> {
+  guardShellCommand(command, evidence);
+  const baseRoot = prepared.root;
+  const commandCwd = prepared.cwd;
+  const effectiveTimeoutSec = prepared.timeoutSec;
   const start = Date.now();
 
   return await new Promise((resolve, reject) => {
