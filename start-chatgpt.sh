@@ -268,11 +268,33 @@ stop_stale_runtime_processes() {
   fi
 }
 
+wait_for_volume_mount() {
+  # At login, an external/network volume under /Volumes can still be
+  # mounting when a login item fires this script. `mkdir -p` then tries to
+  # create the volume's own mount point under /Volumes (owned by root) and
+  # fails with "Permission denied", which looks identical to a real
+  # workspace misconfiguration but is actually just a startup race.
+  local path="$1" timeout="${2:-30}" waited=0 vol
+  case "$path" in
+    /Volumes/*)
+      vol="/Volumes/$(printf '%s\n' "$path" | cut -d/ -f3)"
+      while [[ ! -d "$vol" && "$waited" -lt "$timeout" ]]; do
+        sleep 1
+        waited=$((waited + 1))
+      done
+      if [[ ! -d "$vol" ]]; then
+        echo "[chatgpt2codex] warning: volume $vol did not mount within ${timeout}s" >&2
+      fi
+      ;;
+  esac
+}
+
 run_macos_doctor
 
 need_cmd node
 need_cmd curl
 
+wait_for_volume_mount "$WORKSPACE" 30
 mkdir -p "$WORKSPACE"
 WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 
