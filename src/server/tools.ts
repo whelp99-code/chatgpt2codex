@@ -15,7 +15,7 @@ import {
   type ToolContext,
   type ToolResult,
 } from "../types.js";
-import { scanWorkspaces, findProject } from "../workspace/registry.js";
+import { scanWorkspaces, findProject, ensureProjectMarker } from "../workspace/registry.js";
 
 /**
  * The workspace roots for this context.
@@ -25,6 +25,59 @@ import { scanWorkspaces, findProject } from "../workspace/registry.js";
  * primary root keeps those callers working instead of handing `undefined` to
  * a scan.
  */
+/** Longest name `project_create` accepts, well under every filesystem limit. */
+const PROJECT_NAME_MAX = 100;
+
+/**
+ * Validate a folder name for `project_create`.
+ *
+ * The scanner only descends one level below a workspace root and skips dotted
+ * names, so a name carrying a separator or a leading dot would create a folder
+ * that can never be selected — the exact confusion this tool exists to remove.
+ * Rejecting it here also keeps the name from walking out of the root.
+ */
+function assertProjectFolderName(raw: string): string {
+  const reject = (reason: string): never => {
+    throw new DomainError(ErrorCode.INVALID_PROJECT_NAME, reason, { name: raw });
+  };
+  if (raw.includes("\0")) {
+    throw new DomainError(ErrorCode.NULLBYTE_REJECTED, "Project name contains a null byte.");
+  }
+  const name = raw.trim();
+  if (name.length === 0) reject("Project name is empty.");
+  if (name.length > PROJECT_NAME_MAX) {
+    reject(`Project name is longer than ${PROJECT_NAME_MAX} characters.`);
+  }
+  if (name.includes("/") || name.includes("\\")) {
+    reject("Project name must be one folder directly under a workspace root, without a path separator.");
+  }
+  if (name.startsWith(".")) {
+    reject("A name starting with '.' is skipped by the project scanner and could never be selected.");
+  }
+  return name;
+}
+
+/**
+ * Resolve which configured root a new project goes under.
+ *
+ * An unmatched request is refused rather than silently redirected to the
+ * primary root, so a caller never creates a project somewhere it did not ask
+ * for.
+ */
+function pickWorkspaceRoot(roots: string[], requested?: string): string {
+  if (requested === undefined) return roots[0] as string;
+  const target = path.resolve(requested);
+  const match = roots.find((root) => path.resolve(root) === target);
+  if (match === undefined) {
+    throw new DomainError(
+      ErrorCode.PATH_OUTSIDE_WORKSPACE,
+      `Not a configured workspace root: ${requested}`,
+      { requested, roots },
+    );
+  }
+  return match;
+}
+
 function workspaceRootsOf(ctx: ToolContext): string[] {
   const roots = ctx.workspaceRoots;
   if (Array.isArray(roots) && roots.length > 0) return roots;
@@ -172,7 +225,13 @@ async function resolveOrThrow(
       candidates: (result.candidates ?? []).map((c) => c.projectId),
     });
   }
-  throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, `Project not found: ${q.projectId ?? q.name}`);
+  // A folder created by hand is invisible until it carries a project marker,
+  // so "not found" here often means "never indexed" rather than "absent".
+  // Name both recoveries instead of leaving the caller to guess.
+  throw new DomainError(
+    ErrorCode.PROJECT_NOT_FOUND,
+    `Project not found: ${q.projectId ?? q.name}. If its folder already exists, call workspace_refresh_index; to create it, call project_create.`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +948,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "Report: include changed files, verification command/output, proof artifact, and remaining risk without claiming unstaged work is committed.",
             ],
             toolSurfaceMap: {
-              discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_select"],
+              discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_create", "project_select"],
               inspect: ["project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
               modify: ["file_apply_patch", "file_create", "local_shell_run"],
               verify: ["verification_profile", "verification_run", "command_list", "local_shell_run", "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"],
@@ -1545,6 +1604,102 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               `Could not read: ${failedRoots.map((f) => f.root).join(", ")}`
             : `Refreshed workspace index: ${scanned.length} project(s) across ${rootCount} root(s).`;
         return makeResult({ count: scanned.length, updatedAt, roots, failedRoots }, summary);
+      });
+    },
+  );
+
+  registerTool(
+    "project_create",
+    {
+      title: "Create a project folder",
+      description:
+        "Create a new project folder directly under a workspace root, mark it so the scanner indexes it, and register it. Returns the projectId to pass to project_select. An existing folder keeps its contents and only gains the marker.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Creating project folder...", "Project folder created"),
+      inputSchema: {
+        name: z.string(),
+        workspaceRoot: z.string().optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "project_create", input, async () => {
+        const roots = workspaceRootsOf(ctx);
+        if (roots.length === 0) {
+          throw new DomainError(
+            ErrorCode.WORKSPACE_NOT_READY,
+            "No workspace root is configured, so there is nowhere to create a project.",
+          );
+        }
+        const root = pickWorkspaceRoot(roots, input.workspaceRoot);
+        const name = assertProjectFolderName(input.name);
+        // resolveInProject lstats every component, so a symlinked name cannot
+        // land the new folder outside the root.
+        const dir = await resolveInProject(root, name, { allowSymlink: false, rejectRoot: true });
+
+        const existing = await fs.stat(dir).catch(() => null);
+        if (existing !== null && !existing.isDirectory()) {
+          throw new DomainError(ErrorCode.FILE_EXISTS, `A file already exists at ${name}.`, {
+            name,
+          });
+        }
+        const createdFolder = existing === null;
+        await fs.mkdir(dir, { recursive: true });
+        const marker = await ensureProjectMarker(dir);
+
+        const { entries: scanned, failedRoots } = await scanWorkspaces(roots);
+        ctx.registry.splice(0, ctx.registry.length, ...scanned);
+        await ctx.store.saveProjects(scanned);
+
+        // Match on the real path: resolveInProject already resolved symlinks
+        // (on macOS /var is itself one), while the scanner records roots as
+        // configured, so comparing the two textually would miss the folder
+        // that was just created.
+        const realOf = async (p: string): Promise<string> =>
+          fs.realpath(p).catch(() => path.resolve(p));
+        const resolvedDir = await realOf(dir);
+        let entry: ProjectRegistryEntry | undefined;
+        for (const candidate of scanned) {
+          if ((await realOf(candidate.root)) === resolvedDir) {
+            entry = candidate;
+            break;
+          }
+        }
+        if (entry === undefined) {
+          // The folder and its marker exist, so a miss here means the scan
+          // itself could not read the root; say so instead of reporting a
+          // projectId the caller cannot select.
+          throw new DomainError(
+            ErrorCode.WORKSPACE_NOT_READY,
+            `Created ${name}, but it is not in the index. Unreadable roots: ${
+              failedRoots.map((f) => f.root).join(", ") || "none reported"
+            }`,
+            { name, root, failedRoots },
+          );
+        }
+
+        await ctx.ledger.append({
+          type: "project.created",
+          projectId: entry.projectId,
+          root: entry.root,
+          workspaceRoot: root,
+          createdFolder,
+          marker,
+        });
+
+        const summary = createdFolder
+          ? `Created project ${entry.projectId} at ${entry.root}. Select it with project_select.`
+          : `Registered the existing folder ${entry.root} as project ${entry.projectId}. Its contents were left untouched.`;
+        return makeResult(
+          {
+            projectId: entry.projectId,
+            root: entry.root,
+            workspaceRoot: root,
+            createdFolder,
+            marker,
+            count: scanned.length,
+          },
+          summary,
+        );
       });
     },
   );

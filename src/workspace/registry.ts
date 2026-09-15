@@ -46,6 +46,31 @@ async function hasAnyProjectMarker(dir: string): Promise<boolean> {
   return false;
 }
 
+/**
+ * Give `dir` a marker so {@link scanWorkspace} stops skipping it.
+ *
+ * A folder with no marker is invisible to project_select, which reads as "the
+ * project does not exist" rather than "the folder is not marked". Creating one
+ * lives here so the marker rules stay in a single file.
+ *
+ * A folder that already qualifies is left untouched — contents are never
+ * modified, only a missing marker is added.
+ */
+export async function ensureProjectMarker(
+  dir: string,
+): Promise<"existing" | "git" | "chatgpt2codex"> {
+  if (await hasAnyProjectMarker(dir)) return "existing";
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: dir });
+    return "git";
+  } catch {
+    // git can be absent or refuse to run (a nested repo, a hostile umask).
+    // The scanner accepts this marker too, so the folder stays selectable.
+    await fs.mkdir(path.join(dir, ".chatgpt2codex"), { recursive: true });
+    return "chatgpt2codex";
+  }
+}
+
 /** `git rev-parse --abbrev-ref HEAD`, tolerating non-git or detached/broken repos. */
 async function getBranch(dir: string): Promise<string | undefined> {
   try {

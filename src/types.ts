@@ -204,6 +204,9 @@ export enum ErrorCode {
   SECRET_BLOCKED = "SECRET_BLOCKED",
   TIMEOUT = "TIMEOUT",
   AMBIGUOUS_PROJECT = "AMBIGUOUS_PROJECT",
+  /** A new project folder name the scanner could never index (a separator, a
+   * leading dot, or an empty name). */
+  INVALID_PROJECT_NAME = "INVALID_PROJECT_NAME",
   WORKSPACE_NOT_READY = "WORKSPACE_NOT_READY",
   // Additional codes referenced by the PRD tool catalog (§8) that stub
   // implementations may also raise; kept here so every module shares one
