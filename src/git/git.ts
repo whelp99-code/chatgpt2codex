@@ -11,6 +11,9 @@ const EXEC_OPTS = {
   // Never shell:true — args are passed as an argv array, not interpolated.
   windowsHide: true,
   maxBuffer: 10 * 1024 * 1024,
+  // Error handling below matches git's English messages; a localized git
+  // (e.g. LANG=ko_KR.UTF-8 on Ubuntu) would otherwise slip past every check.
+  env: { ...process.env, LC_ALL: "C", LANGUAGE: "C" },
 } as const;
 
 /**
