@@ -68,6 +68,44 @@ export function inferNetworkCommand(command: string): boolean {
   return NETWORK_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
 }
 
+// Shell idioms that exist only to write a file. A model reaching for these
+// through local_shell_run usually wanted file_create/file_apply_patch, which
+// need no approval — and a heredoc body mentioning `ssh` or `gh` is enough to
+// make the whole command look like network egress.
+const FILE_WRITE_SHELL_PATTERNS = [
+  /<<-?\s*['"]?\w+/u,
+  /(^|[^<>&0-9])>>?\s*(?!\/dev\/null\b)[^\s&|;>]/u,
+  /\btee\b/u,
+  /\b(touch|mkdir|cp|mv)\b/u,
+];
+
+export function looksLikeFileWrite(command: string): boolean {
+  return FILE_WRITE_SHELL_PATTERNS.some((pattern) => pattern.test(command));
+}
+
+/**
+ * What the caller should do next when local_shell_run stops at approval.
+ *
+ * Two dead ends were observed in practice: ChatGPT created source files with
+ * `cat > file <<EOF`, tripped the network heuristic on the file's contents,
+ * and reported the work as blocked; and the owner could not open the
+ * returned 127.0.0.1 approval URL because the server was a remote Ubuntu
+ * host. Neither changes the gate itself — this only says how to get past it.
+ */
+export function shellApprovalGuidance(command: string, approvalUrl?: string): Record<string, string> {
+  const guidance: Record<string, string> = {};
+  if (looksLikeFileWrite(command)) {
+    guidance.fileWriteHint =
+      "To create or edit project files, use file_create (new file) or file_apply_patch (existing file) instead of local_shell_run. They need only a full-write lease, not owner approval.";
+  }
+  const port = approvalUrl ? /^http:\/\/127\.0\.0\.1:(\d+)\//u.exec(approvalUrl)?.[1] : undefined;
+  if (port) {
+    guidance.approvalAccessHint =
+      `approvalUrl only opens in a browser on the machine running chatgpt2codex. From another computer, forward the port first (ssh -L ${port}:127.0.0.1:${port} <server>), open approvalUrl, sign in with the Owner Token, approve once, then retry the identical request with approvalId.`;
+  }
+  return guidance;
+}
+
 function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
   const limit = OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES;
   if (buf.length <= limit) {
@@ -95,6 +133,7 @@ export function guardShellSafety(command: string): void {
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
         "local_shell_run blocked an OS-level destructive command",
+        { approvable: "false", ...shellApprovalGuidance(command) },
       );
     }
   }

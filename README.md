@@ -81,6 +81,7 @@ project:
 - summarize diffs, blockers, and verification evidence
 - discover and run a project verification profile, then bind completion to the current diff
 - retain user-confirmed what/why feedback and propose a bounded Skill improvement after three records
+- run GitHub-centred development management: labels, milestones, a shared GitHub Project board, duplicate-free Issue creation and migration mapping, and Done gated on real CI evidence ([guide](docs/development-management-tool.md))
 
 The standout workflow is:
 

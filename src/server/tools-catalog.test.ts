@@ -175,9 +175,8 @@ describe("tool catalog", () => {
 
     expect(result.structuredContent?.codexGradeLoop?.join(" ")).toContain("Discover");
     expect(result.structuredContent?.codexGradeLoop?.join(" ")).toContain("Verify");
-    expect(result.structuredContent?.toolSurfaceMap?.modify).toEqual(
-      expect.arrayContaining(["file_apply_patch", "file_create", "local_shell_run"]),
-    );
+    expect(result.structuredContent?.toolSurfaceMap?.modify).toEqual(["file_apply_patch", "file_create"]);
+    expect(result.structuredContent?.toolSurfaceMap?.manage).toEqual(expect.arrayContaining(["dev_management"]));
     expect(result.structuredContent?.toolSurfaceMap?.verify).toEqual(
       expect.arrayContaining(["verification_profile", "verification_run", "e2e_test_and_show_screenshot", "e2e_run_command"]),
     );
@@ -242,6 +241,7 @@ describe("tool catalog", () => {
       "github_pr_comment",
       "github_pr_request_review",
       "github_delivery",
+      "dev_management",
     ];
     for (const name of readTools) {
       expect(tools?.[name]?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
@@ -263,6 +263,9 @@ describe("tool catalog", () => {
       body: "Must fail before spawning gh",
     });
     expect(denied?.structuredContent).toMatchObject({ code: "LEASE_REQUIRED" });
+
+    const managementDenied = await tools?.dev_management?.handler?.({ projectId: "project", operation: "survey" });
+    expect(managementDenied?.structuredContent).toMatchObject({ code: "LEASE_REQUIRED" });
   });
 
   describe("ChatGPT confirm-model exposure (CHATGPT2CODEX_CONTROL_CHATGPT)", () => {
