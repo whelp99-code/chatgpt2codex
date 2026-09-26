@@ -31,7 +31,7 @@ update Issues.
 - Add or remove existing labels
 - Add or remove assignees
 - Close or reopen Issues
-- Create a Pull Request from the current named branch
+- Create a Pull Request (optionally as a draft) from the current named branch
 - Update Pull Request title/body
 - Add Pull Request comments
 - Request Pull Request reviewers
@@ -53,3 +53,10 @@ access.
 The MCP catalog exposes dedicated tools for each operation. The GPT Actions
 schema exposes one `github_delivery` operation because GPT Actions permit at
 most 30 operations per schema.
+
+## Development management
+
+Labels, milestones, GitHub Projects (v2), idempotent Issue creation/migration
+with a source mapping, and evidence-gated Done live in the `dev_management`
+tool. See [development-management-tool.md](development-management-tool.md).
+Project writes additionally need the `project` scope (`gh auth refresh -s project`).

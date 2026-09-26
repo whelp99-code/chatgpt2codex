@@ -30,7 +30,7 @@ export interface GitHubPullRequestUpdate {
   body?: string;
 }
 
-async function defaultRunner(call: GitHubCommandCall): Promise<string> {
+export async function defaultGitHubRunner(call: GitHubCommandCall): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = execFile(
       call.command,
@@ -93,7 +93,7 @@ export function parseGitHubRepository(remote: string): string {
   return canonicalRepository(parts[0], parts[1], remote);
 }
 
-async function projectRepository(root: string, runner: GitHubCommandRunner): Promise<string> {
+export async function projectRepository(root: string, runner: GitHubCommandRunner): Promise<string> {
   const remote = await runner({
     cwd: root,
     command: "git",
@@ -145,7 +145,7 @@ function appendRepeated(args: string[], flag: string, values: readonly string[] 
 export async function listGitHubIssues(
   root: string,
   options: { state?: "open" | "closed" | "all"; limit?: number },
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<Record<string, unknown>[]> {
   const raw = await runGitHub(
     root,
@@ -167,7 +167,7 @@ export async function listGitHubIssues(
 export async function getGitHubIssue(
   root: string,
   number: number,
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<Record<string, unknown>> {
   const raw = await runGitHub(
     root,
@@ -186,7 +186,7 @@ export async function getGitHubIssue(
 export async function createGitHubIssue(
   root: string,
   input: { title: string; body: string; labels?: string[]; assignees?: string[] },
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; url: string }> {
   const args = ["issue", "create", "--title", input.title, "--body-file", "-"];
   appendRepeated(args, "--label", input.labels);
@@ -198,7 +198,7 @@ export async function updateGitHubIssue(
   root: string,
   number: number,
   input: GitHubIssueUpdate,
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; updated: true }> {
   const args = ["issue", "edit", String(number)];
   if (input.title !== undefined) args.push("--title", input.title);
@@ -215,7 +215,7 @@ export async function commentOnGitHubIssue(
   root: string,
   number: number,
   body: string,
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; url: string }> {
   const url = (await runGitHub(root, ["issue", "comment", String(number), "--body-file", "-"], runner, body)).trim();
   return { number, url };
@@ -225,7 +225,7 @@ export async function setGitHubIssueState(
   root: string,
   number: number,
   state: "open" | "closed",
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; state: "open" | "closed" }> {
   await runGitHub(root, ["issue", state === "closed" ? "close" : "reopen", String(number)], runner);
   return { number, state };
@@ -247,12 +247,13 @@ async function currentBranch(root: string, runner: GitHubCommandRunner): Promise
 
 export async function createGitHubPullRequest(
   root: string,
-  input: { title: string; body: string; base?: string },
-  runner: GitHubCommandRunner = defaultRunner,
+  input: { title: string; body: string; base?: string; draft?: boolean },
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; url: string }> {
   const branch = await currentBranch(root, runner);
   const args = ["pr", "create", "--head", branch, "--title", input.title, "--body-file", "-"];
   if (input.base) args.push("--base", input.base);
+  if (input.draft) args.push("--draft");
   return parseCreatedUrl(await runGitHub(root, args, runner, input.body), "pull");
 }
 
@@ -260,7 +261,7 @@ export async function updateGitHubPullRequest(
   root: string,
   number: number,
   input: GitHubPullRequestUpdate,
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; updated: true }> {
   const args = ["pr", "edit", String(number)];
   if (input.title !== undefined) args.push("--title", input.title);
@@ -273,7 +274,7 @@ export async function commentOnGitHubPullRequest(
   root: string,
   number: number,
   body: string,
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; url: string }> {
   const url = (await runGitHub(root, ["pr", "comment", String(number), "--body-file", "-"], runner, body)).trim();
   return { number, url };
@@ -283,7 +284,7 @@ export async function requestGitHubPullRequestReview(
   root: string,
   number: number,
   reviewers: string[],
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<{ number: number; reviewers: string[] }> {
   const args = ["pr", "edit", String(number)];
   appendRepeated(args, "--add-reviewer", reviewers);
@@ -294,7 +295,7 @@ export async function requestGitHubPullRequestReview(
 export async function getGitHubPullRequestChecks(
   root: string,
   number: number,
-  runner: GitHubCommandRunner = defaultRunner,
+  runner: GitHubCommandRunner = defaultGitHubRunner,
 ): Promise<Record<string, unknown>[]> {
   let raw: string;
   try {

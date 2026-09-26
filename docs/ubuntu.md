@@ -91,6 +91,31 @@ A root showing `0 project(s)` usually means a typo in the path. Roots are
 created when missing rather than reported as an error, so a mistyped path
 shows up as an empty folder instead of a failure.
 
+## Approving a shell command on a remote box
+
+`local_shell_run` stops with `APPROVAL_REQUIRED` for commands that look like
+network access (`curl`, `ssh`, `gh`, `git push`, `npm install`, ...) or that the
+model marks destructive. The returned `approvalUrl` is
+`http://127.0.0.1:<port>/admin/shell-approvals/<id>` and only accepts a browser
+on the machine running chatgpt2codex; tunnelled requests are refused.
+
+From another computer, forward the port over SSH first (default port 7979;
+keep both sides the same so the Host check matches):
+
+```bash
+ssh -L 7979:127.0.0.1:7979 you@ubuntu-host
+```
+
+Open the `approvalUrl` locally, sign in with the Owner Token, choose
+**한 번 승인**, then ask ChatGPT to retry the identical command with the
+`approvalId`.
+
+Creating or editing files never needs this: ChatGPT should use `file_create`
+and `file_apply_patch`. A `cat > file <<EOF` whose contents mention `ssh` or
+`gh` trips the network check, which is the usual reason file creation "needs
+approval". The error now carries `fileWriteHint` and `approvalAccessHint`
+fields saying so.
+
 ## Running alongside a macOS instance
 
 Both machines can serve at once, but they need separate Cloudflare tunnels.

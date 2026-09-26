@@ -1197,6 +1197,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             title: { type: "string", minLength: 1, maxLength: 256 },
             body: { type: "string", maxLength: 65536 },
             base: { type: "string", minLength: 1, maxLength: 255 },
+            draft: { type: "boolean" },
             labels: { type: "array", maxItems: 20, items: { type: "string", minLength: 1, maxLength: 100 } },
             assignees: { type: "array", maxItems: 20, items: { type: "string", minLength: 1, maxLength: 100 } },
             addLabels: { type: "array", maxItems: 20, items: { type: "string", minLength: 1, maxLength: 100 } },

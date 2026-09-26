@@ -117,7 +117,7 @@ import {
   recordFeedback,
   reviewSkillFeedback,
 } from "../improvement.js";
-import { guardShellSafety, inferNetworkCommand, issueNetworkApprovalEvidence, prepareLocalShell, runLocalShell, runPreparedLocalShell } from "../exec/local-shell.js";
+import { guardShellSafety, inferNetworkCommand, issueNetworkApprovalEvidence, prepareLocalShell, runLocalShell, runPreparedLocalShell, shellApprovalGuidance } from "../exec/local-shell.js";
 import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { addToolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
 import {
@@ -144,7 +144,26 @@ import {
   setGitHubIssueState,
   updateGitHubIssue,
   updateGitHubPullRequest,
+  defaultGitHubRunner,
+  parseGitHubRepository,
 } from "../github/github.js";
+import {
+  DEFAULT_LABELS,
+  PRIORITY_OPTIONS,
+  STATUS_OPTIONS,
+  cancelIssue,
+  ensureLabels,
+  ensureMilestone,
+  ensureProject,
+  mappingCsv,
+  markBlocked,
+  readMapping,
+  setItemStatus,
+  upsertSourceIssues,
+  verifyDoneEvidence,
+  type ProjectInfo,
+} from "../github/management.js";
+import { createManagementBranch, scaffoldManagementFiles, surveyProject } from "../github/management-setup.js";
 import { resolveInProject } from "../policy/paths.js";
 import { isSecretPath, redact } from "../policy/secrets.js";
 import { resolveActiveProject } from "../workspace/active.js";
@@ -943,17 +962,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             codexGradeLoop: [
               "Discover: project_status, project_rules, repo_diff_summary, and narrow code_search before choosing a change.",
               "Plan: state one small, high-leverage hypothesis tied to repo understanding, security, UX, install, or verification.",
-              "Patch: use file_read_slice plus file_apply_patch/file_create; never ask the user to paste local scripts when tools are available.",
+              "Patch: use file_read_slice plus file_apply_patch/file_create; never create or edit files through local_shell_run (it stops at owner approval) and never ask the user to paste local scripts when tools are available.",
               "Verify: run the closest typecheck, targeted test, build, native-app E2E, or screenshot proof for the changed surface.",
               "Report: include changed files, verification command/output, proof artifact, and remaining risk without claiming unstaged work is committed.",
             ],
             toolSurfaceMap: {
               discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_create", "project_select"],
               inspect: ["project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
-              modify: ["file_apply_patch", "file_create", "local_shell_run"],
+              modify: ["file_apply_patch", "file_create"],
               verify: ["verification_profile", "verification_run", "command_list", "local_shell_run", "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"],
               improve: ["feedback_record", "skill_improvement_review", "skill_improvement_propose"],
               release: ["git_diff_summary", "git_commit", "git_push", "checkpoint_list"],
+              manage: ["dev_management", "github_delivery"],
               media: ["gpt_image_2_workflow", "save_chatgpt_image_from_url", "save_image_from_url", "save_image_from_clipboard", "save_image_from_download", "save_image_from_path"],
             },
             securityModel: [
@@ -2290,7 +2310,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run local project shell",
       description:
-        "Run an arbitrary local shell command inside the selected project, Codex-style. Use when allowlisted command_run is too limited. Project-confined; output is redacted; secret-path and OS-destructive commands are blocked.",
+        "Run an arbitrary local shell command inside the selected project, Codex-style. Use when allowlisted command_run is too limited. Do not use it to create or edit files (use file_create/file_apply_patch): network-looking or destructive commands stop at owner approval. Project-confined; output is redacted; secret-path and OS-destructive commands are blocked.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running local shell...", "Local shell finished"),
       inputSchema: {
@@ -2326,7 +2346,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         if (needsApproval) {
           if (!ctx.shellApprovals || !ctx.shellApprovalUrl) {
-            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is unavailable for this non-HTTP session; retry through the HTTP MCP server.");
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is unavailable for this non-HTTP session; retry through the HTTP MCP server.", shellApprovalGuidance(input.command));
           }
           const binding = {
             command: input.command, root: prepared.root, cwd: prepared.cwd, timeoutSec: prepared.timeoutSec,
@@ -2340,8 +2360,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           } else if (input.approvalId) {
             const pending = ctx.shellApprovals.getPendingForRetry(input.approvalId, binding, input.approvalResumeToken);
             if (pending) {
+              const approvalUrl = ctx.shellApprovalUrl(pending.approvalId);
               throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is still pending.", {
-                approvalId: pending.approvalId, expiresAt: pending.expiresAt, approvalUrl: ctx.shellApprovalUrl(pending.approvalId),
+                approvalId: pending.approvalId, expiresAt: pending.expiresAt, approvalUrl, ...shellApprovalGuidance(input.command, approvalUrl),
               });
             }
             throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "approvalId is expired, denied, consumed, or does not match this exact request.");
@@ -2349,8 +2370,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             const requested = ctx.shellApprovals.request(binding, ctx.shellApprovalAction === true);
             const pending = requested.record;
             await ctx.ledger.append({ type: "shell_approval.requested", approvalId: pending.approvalId, projectId: input.projectId });
+            const approvalUrl = ctx.shellApprovalUrl(pending.approvalId);
             throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Owner approval is required before this local shell request can run.", {
-              approvalId: pending.approvalId, expiresAt: pending.expiresAt, approvalUrl: ctx.shellApprovalUrl(pending.approvalId), ...(requested.resumeToken ? { approvalResumeToken: requested.resumeToken } : {}),
+              approvalId: pending.approvalId, expiresAt: pending.expiresAt, approvalUrl, ...(requested.resumeToken ? { approvalResumeToken: requested.resumeToken } : {}),
+              ...shellApprovalGuidance(input.command, approvalUrl),
             });
           }
         }
@@ -3189,6 +3212,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         title: z.string().min(1).max(256),
         body: z.string().max(65_536),
         base: z.string().min(1).max(255).optional(),
+        draft: z.boolean().optional(),
       },
     },
     async (input) => {
@@ -3348,6 +3372,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         title: z.string().min(1).max(256).optional(),
         body: z.string().max(65_536).optional(),
         base: z.string().min(1).max(255).optional(),
+        draft: z.boolean().optional(),
         labels: z.array(z.string().min(1).max(100)).max(20).optional(),
         assignees: z.array(z.string().min(1).max(100)).max(20).optional(),
         addLabels: z.array(z.string().min(1).max(100)).max(20).optional(),
@@ -3417,6 +3442,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               title: requiredTitle(),
               body: requiredBody(),
               base: input.base,
+              draft: input.draft,
             });
             break;
           case "pr_update":
@@ -3444,6 +3470,226 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           });
         }
         return makeResult(result, `GitHub delivery operation ${input.operation} completed.`);
+      });
+    },
+  );
+
+  registerTool(
+    "dev_management",
+    {
+      title: "GitHub development management",
+      description:
+        "Set up and run GitHub-centred development management for the selected project: Issues as the work source, a GitHub Project (v2) as the shared board, PR/CI as evidence. " +
+        "Operations: survey (read-only baseline: git, templates, labels, milestones, open PRs, gh scopes, Project fields), scaffold (write missing management files only: docs/development-management.md, Issue/PR templates, AGENTS.md if absent, a Refs-not-Closes PR check), branch_create, " +
+        "labels_ensure, milestone_ensure, project_ensure (find, or create a private Project only with createIfMissing=true; never rewrites a shared Project's options), issues_upsert (idempotent create-or-reuse by source id with a stored mapping; dryRun defaults to true; staged=true adds migration:staged and keeps items in Backlog), mapping_get, " +
+        "status_set (Ready needs readyApproved and acceptance conditions; Done needs evidence verified against GitHub CI), evidence_check, issue_block, issue_cancel (closed as not planned, never Done). " +
+        "Repository is derived from git origin. Never merges, deletes, force-pushes, or changes credentials or repository settings.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Running development management operation...", "Development management operation completed"),
+      inputSchema: {
+        projectId: z.string(),
+        operation: z.enum([
+          "survey",
+          "scaffold",
+          "branch_create",
+          "labels_ensure",
+          "milestone_ensure",
+          "project_ensure",
+          "issues_upsert",
+          "mapping_get",
+          "status_set",
+          "evidence_check",
+          "issue_block",
+          "issue_cancel",
+        ]),
+        mode: z.enum(["new_project", "existing_project"]).optional(),
+        productName: z.string().min(1).max(100).optional(),
+        workername: z.string().min(1).max(100).optional(),
+        includeWorkflow: z.boolean().optional(),
+        branch: z.string().min(1).max(100).optional(),
+        projectTitle: z.string().min(1).max(100).optional(),
+        projectOwner: z.string().min(1).max(39).optional(),
+        projectNumber: z.number().int().positive().optional(),
+        createIfMissing: z.boolean().optional(),
+        addMissingFields: z.boolean().optional(),
+        milestone: z
+          .object({
+            title: z.string().min(1).max(100),
+            description: z.string().max(1000).optional(),
+            dueOn: z.string().max(40).optional(),
+          })
+          .optional(),
+        items: z
+          .array(
+            z.object({
+              sourceSystem: z.string().min(1).max(32),
+              sourceId: z.string().min(1).max(200),
+              sourceUrl: z.string().max(2000).optional(),
+              sourceUpdatedAt: z.string().max(64).optional(),
+              sourceHash: z.string().max(128).optional(),
+              sourceAuthor: z.string().max(200).optional(),
+              sourceCreatedAt: z.string().max(64).optional(),
+              title: z.string().min(1).max(256),
+              body: z.string().max(60_000),
+              labels: z.array(z.string().min(1).max(50)).max(20).optional(),
+              milestone: z.string().min(1).max(100).optional(),
+              priority: z.enum(PRIORITY_OPTIONS).optional(),
+              targetIssue: z.number().int().positive().optional(),
+              excludeReason: z.string().min(1).max(500).optional(),
+            }),
+          )
+          .max(200)
+          .optional(),
+        staged: z.boolean().optional(),
+        number: z.number().int().positive().optional(),
+        status: z.enum(STATUS_OPTIONS).optional(),
+        priority: z.enum(PRIORITY_OPTIONS).optional(),
+        readyApproved: z.boolean().optional(),
+        evidence: z
+          .object({
+            kind: z.enum(["code", "document"]),
+            sha: z.string().max(40).optional(),
+            artifactDigest: z.string().max(80).optional(),
+            scopeVersion: z.string().max(100),
+            environment: z.string().max(200),
+            verifiedAt: z.string().max(40),
+            runUrl: z.string().max(2000),
+            acceptance: z.string().max(2000),
+          })
+          .optional(),
+        blocked: z.boolean().optional(),
+        cause: z.string().max(2000).optional(),
+        nextOwner: z.string().max(100).optional(),
+        checkAt: z.string().max(64).optional(),
+        reason: z.string().max(2000).optional(),
+        dryRun: z.boolean().optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "dev_management", input, async () => {
+        const op = input.operation;
+        const readOnly =
+          op === "survey" ||
+          op === "mapping_get" ||
+          op === "evidence_check" ||
+          (op === "project_ensure" && !input.createIfMissing && !input.addMissingFields);
+        const localWrite = op === "scaffold" || op === "branch_create";
+        await requireProjectLease(ctx, input.projectId, readOnly ? "read" : localWrite ? "write" : "remote");
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const root = entry.root;
+        const need = <T>(value: T | undefined, name: string): T => {
+          if (value === undefined) throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `${op} requires ${name}`);
+          return value;
+        };
+        const repository = async (): Promise<string> => parseGitHubRepository(
+          await defaultGitHubRunner({ cwd: root, command: "git", args: ["config", "--get", "remote.origin.url"] }),
+        );
+        const boardFor = async (): Promise<ProjectInfo | undefined> => {
+          if (!input.projectTitle && input.projectNumber === undefined) return undefined;
+          const found = await ensureProject(root, {
+            owner: input.projectOwner,
+            title: input.projectTitle ?? "",
+            projectNumber: input.projectNumber,
+          });
+          if (!found.project) {
+            throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `Project "${input.projectTitle}" not found; run project_ensure first.`, {
+              candidates: found.candidates,
+            });
+          }
+          return found.project;
+        };
+        const requireBoard = async (): Promise<ProjectInfo> => {
+          const board = await boardFor();
+          if (!board) throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `${op} requires projectTitle or projectNumber`);
+          return board;
+        };
+
+        let result: Record<string, unknown>;
+        switch (op) {
+          case "survey":
+            result = { ...(await surveyProject(root, { projectTitle: input.projectTitle, projectOwner: input.projectOwner })) };
+            break;
+          case "scaffold": {
+            const scaffold = await scaffoldManagementFiles(root, {
+              mode: input.mode ?? "new_project",
+              productName: need(input.productName, "productName"),
+              workername: input.workername ?? input.projectId,
+              repository: await repository(),
+              projectTitle: input.projectTitle,
+              includeWorkflow: input.includeWorkflow,
+              dryRun: input.dryRun,
+            });
+            let checkpointId: string | undefined;
+            if (!scaffold.dryRun && scaffold.created.length) {
+              checkpointId = (await createCheckpoint(root, input.projectId, "create")).checkpointId;
+            }
+            result = { ...scaffold, checkpointId, commitPaths: scaffold.created };
+            break;
+          }
+          case "branch_create":
+            result = await createManagementBranch(root, need(input.branch, "branch"));
+            break;
+          case "labels_ensure":
+            result = await ensureLabels(root, DEFAULT_LABELS, { dryRun: input.dryRun });
+            break;
+          case "milestone_ensure":
+            result = await ensureMilestone(root, need(input.milestone, "milestone"), { dryRun: input.dryRun });
+            break;
+          case "project_ensure":
+            result = await ensureProject(root, {
+              owner: input.projectOwner,
+              title: need(input.projectTitle, "projectTitle"),
+              projectNumber: input.projectNumber,
+              createIfMissing: input.createIfMissing,
+              addMissingFields: input.addMissingFields,
+              dryRun: input.dryRun,
+            });
+            break;
+          case "issues_upsert": {
+            const report = await upsertSourceIssues(root, ctx.stateDir, {
+              items: need(input.items, "items"),
+              dryRun: input.dryRun !== false,
+              staged: input.staged === true,
+              project: await boardFor(),
+            });
+            result = { ...report };
+            break;
+          }
+          case "mapping_get": {
+            const entries = await readMapping(ctx.stateDir, await repository());
+            result = { entries, csv: mappingCsv(entries) };
+            break;
+          }
+          case "status_set":
+            result = await setItemStatus(root, {
+              project: await requireBoard(),
+              issueNumber: need(input.number, "number"),
+              status: need(input.status, "status"),
+              priority: input.priority,
+              evidence: input.evidence,
+              readyApproved: input.readyApproved,
+            });
+            break;
+          case "evidence_check":
+            result = { ...(await verifyDoneEvidence(root, need(input.number, "number"), need(input.evidence, "evidence"))) };
+            break;
+          case "issue_block":
+            result = await markBlocked(root, {
+              issueNumber: need(input.number, "number"),
+              blocked: input.blocked !== false,
+              cause: input.cause,
+              nextOwner: input.nextOwner,
+              checkAt: input.checkAt,
+            });
+            break;
+          case "issue_cancel":
+            result = await cancelIssue(root, { issueNumber: need(input.number, "number"), reason: need(input.reason, "reason") });
+            break;
+        }
+        if (!readOnly && input.dryRun !== true && !(op === "issues_upsert" && input.dryRun !== false)) {
+          await ctx.ledger.append({ type: "dev_management.completed", projectId: input.projectId, operation: op, number: input.number });
+        }
+        return makeResult(result, `Development management operation ${op} completed.`);
       });
     },
   );
