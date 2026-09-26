@@ -181,6 +181,19 @@ describe("upsertSourceIssues", () => {
     expect(linked.entries[0]).toMatchObject({ result: "reused", target_issue: 1 });
   });
 
+  it("blocks a second source with the same title in one batch, on dry run and for real", async () => {
+    const gh = fakeGitHub();
+    const items = [item("ENG-1", { title: "Same title" }), item("ENG-2", { title: "same title " })];
+    const dry = await upsertSourceIssues("/repo", stateDir, { items, dryRun: true, staged: false }, gh.runner);
+    expect(dry.entries.map((e) => e.result)).toEqual(["would_create", "blocked"]);
+    const real = await upsertSourceIssues("/repo", stateDir, { items, dryRun: false, staged: false }, gh.runner);
+    expect(real.entries.map((e) => e.result)).toEqual(["created", "blocked"]);
+    expect(real.entries[1]!.reason).toMatch(/linear:ENG-1 earlier in this batch/u);
+    expect(gh.creates()).toBe(1);
+    const rerun = await upsertSourceIssues("/repo", stateDir, { items, dryRun: false, staged: false }, gh.runner);
+    expect(rerun.entries.map((e) => e.result)).toEqual(["reused", "blocked"]);
+  });
+
   it("dry run writes nothing and reports would_create", async () => {
     const gh = fakeGitHub();
     const report = await upsertSourceIssues("/repo", stateDir, { items: [item("ENG-1")], dryRun: true, staged: true }, gh.runner);

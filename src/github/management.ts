@@ -902,6 +902,11 @@ export async function upsertSourceIssues(
   const scan = await scanIssues(root, repository, runner);
   const entries: MappingEntry[] = [];
   const seen = new Set<string>();
+  // Titles this batch has already created (or, on a dry run, would create),
+  // keyed to the source that claimed them. Without it, two different sources
+  // sharing a title in one batch both get created, while the same pair split
+  // across two runs is blocked.
+  const batchTitles = new Map<string, string>();
   const sourceChanged: UpsertReport["sourceChanged"] = [];
   const projectItems: UpsertReport["projectItems"] = [];
   const duplicatesOnGitHub: UpsertReport["duplicatesOnGitHub"] = [];
@@ -974,7 +979,13 @@ export async function upsertSourceIssues(
     if (reuse) {
       record("reused", reason, reuse);
     } else {
-      const titleHits = scan.byTitle.get(item.title.trim().toLowerCase()) ?? [];
+      const titleKey = item.title.trim().toLowerCase();
+      const titleHits = scan.byTitle.get(titleKey) ?? [];
+      const claimedBy = batchTitles.get(titleKey);
+      if (claimedBy) {
+        record("blocked", `title matches ${claimedBy} earlier in this batch; set targetIssue to reuse or change the title`);
+        continue;
+      }
       if (titleHits.length) {
         record(
           "blocked",
@@ -986,6 +997,7 @@ export async function upsertSourceIssues(
         record("blocked", `repository has more than ${SCAN_LIMIT} Issues; duplicate check incomplete`);
         continue;
       }
+      batchTitles.set(titleKey, `${item.sourceSystem}:${item.sourceId}`);
       if (input.dryRun) {
         record("would_create", "no existing Issue for this source");
         continue;
