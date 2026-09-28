@@ -372,6 +372,13 @@ export function findProject(
   if (q.projectId) {
     const found = entries.find((e) => e.projectId === q.projectId);
     if (found) return { ok: true, entry: found };
+    // Callers pass the folder name they see (`signed_platform`) as often as
+    // the slugged id (`signed-platform`); accept an exact alias match, but
+    // never a fuzzy one, since an id must not silently pick another project.
+    const norm = normalize(q.projectId);
+    const byAlias = entries.filter((e) => [e.name, ...e.aliases].some((c) => normalize(c) === norm));
+    if (byAlias.length === 1) return { ok: true, entry: byAlias[0] as ProjectRegistryEntry };
+    if (byAlias.length > 1) return { ok: false, reason: "ambiguous", candidates: byAlias };
     return { ok: false, reason: "not_found" };
   }
 

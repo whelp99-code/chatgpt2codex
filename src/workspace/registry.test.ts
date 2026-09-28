@@ -228,6 +228,29 @@ describe("findProject", () => {
     expect(result).toEqual({ ok: false, reason: "not_found" });
   });
 
+  it("resolves a projectId given as the folder name when it matches one alias exactly", () => {
+    const signed: ProjectRegistryEntry = {
+      projectId: "signed-platform",
+      name: "signed_platform",
+      root: "/workspace/1b/signed_platform",
+      aliases: ["signed_platform", "signed-platform"],
+    };
+    expect(findProject([...entries, signed], { projectId: "signed_platform" })).toEqual({ ok: true, entry: signed });
+    expect(findProject([...entries, signed], { projectId: "Signed_Platform" })).toEqual({ ok: true, entry: signed });
+  });
+
+  it("never fuzzy-matches a projectId onto another project", () => {
+    expect(findProject(entries, { projectId: "alpha-ap" })).toEqual({ ok: false, reason: "not_found" });
+  });
+
+  it("reports ambiguity when a projectId matches several aliases exactly", () => {
+    const a: ProjectRegistryEntry = { projectId: "x-api", name: "api", root: "/x/api", aliases: ["api"] };
+    const b: ProjectRegistryEntry = { projectId: "y-api", name: "api", root: "/y/api", aliases: ["api"] };
+    const result = findProject([a, b], { projectId: "api" });
+    expect(result.ok).toBe(false);
+    expect(result).toMatchObject({ reason: "ambiguous" });
+  });
+
   it("resolves exact single match by name", () => {
     const result = findProject(entries, { name: "alpha-app" });
     expect(result.ok).toBe(true);
