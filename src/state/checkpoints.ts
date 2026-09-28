@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DomainError, ErrorCode } from "../types.js";
 import { redact } from "../policy/secrets.js";
+import { gitEnv } from "../git/git.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_DIFF_BYTES = 2 * 1024 * 1024;
@@ -29,7 +30,7 @@ function checkpointPath(root: string, checkpointId: string): string {
 }
 
 async function git(root: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync("git", args, { cwd: root, windowsHide: true, maxBuffer: MAX_DIFF_BYTES });
+  return execFileAsync("git", args, { cwd: root, env: gitEnv(), windowsHide: true, maxBuffer: MAX_DIFF_BYTES });
 }
 
 export async function getWorkingDiff(root: string): Promise<string> {
