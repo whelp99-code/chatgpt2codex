@@ -894,6 +894,8 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             command: { type: "string" },
             cwd: { type: "string" },
             timeoutSec: { type: "integer", minimum: 1, maximum: 900 },
+            approvalId: { type: "string", format: "uuid" },
+            approvalResumeToken: { type: "string" },
             intent: {
               type: "object",
               additionalProperties: false,
