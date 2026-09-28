@@ -84,6 +84,30 @@ describe("gitStatus / gitDiffSummary — non-git directory", () => {
   });
 });
 
+describe("gitStatus — repo without commits under a localized git", () => {
+  let dir: string;
+  const savedLang = process.env.LANG;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "chatgpt2codex-nocommit-"));
+    await execFileAsync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+    await writeFile(join(dir, "draft.txt"), "wip\n");
+    process.env.LANG = "ko_KR.UTF-8";
+  });
+
+  afterEach(async () => {
+    if (savedLang === undefined) delete process.env.LANG;
+    else process.env.LANG = savedLang;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("reports the unborn branch instead of failing on a translated HEAD error", async () => {
+    const status = await gitStatus(dir);
+    expect(status.branch).toBe("main");
+    expect(status.dirtyFiles).toEqual(["draft.txt"]);
+  });
+});
+
 describe("gitStatus — real git repo", () => {
   let dir: string;
 

@@ -6,6 +6,14 @@ import { isSecretPath, redact } from "../policy/secrets.js";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Callers match git's English error messages; a localized git (e.g.
+ * LANG=ko_KR.UTF-8 on Ubuntu) would otherwise slip past every check.
+ */
+export function gitEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, LC_ALL: "C", LANGUAGE: "C" };
+}
+
 /** Options threaded to execFile for every git invocation in this module. */
 const EXEC_OPTS = {
   // Never shell:true — args are passed as an argv array, not interpolated.
@@ -21,7 +29,7 @@ async function runGit(
   cwd: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync("git", args, { ...EXEC_OPTS, cwd });
+  return execFileAsync("git", args, { ...EXEC_OPTS, cwd, env: gitEnv() });
 }
 
 /** True if `err` looks like "not a git repository" / git missing, vs a real failure. */
