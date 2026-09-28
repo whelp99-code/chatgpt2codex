@@ -214,6 +214,7 @@ describe("Custom GPT action bridge", () => {
       components: {
         schemas: {
           CallToolInput: { properties: Record<string, unknown> };
+          LocalShellRunInput: { properties: Record<string, unknown> };
           GoalIntakeInput: Record<string, unknown>;
           GoalLoopInput: Record<string, unknown>;
           E2eRunCommandInput: Record<string, unknown>;
@@ -275,6 +276,8 @@ describe("Custom GPT action bridge", () => {
     expect(body.paths["/actions/checkpoint-list"]).toBeUndefined();
     expect(body.paths["/actions/project-select"]).toBeDefined();
     expect((body.paths["/actions/project-select"] as { post: { operationId: string } }).post.operationId).toBe("project_select");
+    expect(body.components.schemas.LocalShellRunInput.properties.approvalId).toEqual({ type: "string", format: "uuid" });
+    expect(body.components.schemas.LocalShellRunInput.properties.approvalResumeToken).toEqual({ type: "string" });
     expect(body.components.schemas.GoalIntakeInput).toBeDefined();
     expect(body.components.schemas.GoalLoopInput).toBeDefined();
     expect(body.components.schemas.E2eRunCommandInput).toBeDefined();
