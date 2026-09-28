@@ -274,16 +274,24 @@ wait_for_volume_mount() {
   # create the volume's own mount point under /Volumes (owned by root) and
   # fails with "Permission denied", which looks identical to a real
   # workspace misconfiguration but is actually just a startup race.
-  local path="$1" timeout="${2:-30}" waited=0 vol
+  # An encrypted or manually attached disk image can stay unmounted for
+  # hours after login, so the default is to wait until it appears
+  # (timeout 0); CHATGPT2CODEX_VOLUME_WAIT_SECONDS caps the wait instead.
+  local path="$1" timeout="${2:-0}" waited=0 vol
   case "$path" in
     /Volumes/*)
       vol="/Volumes/$(printf '%s\n' "$path" | cut -d/ -f3)"
-      while [[ ! -d "$vol" && "$waited" -lt "$timeout" ]]; do
+      while [[ ! -d "$vol" ]] && [[ "$timeout" -eq 0 || "$waited" -lt "$timeout" ]]; do
+        if (( waited % 60 == 0 )); then
+          echo "[chatgpt2codex] waiting for volume $vol to mount (${waited}s so far)..." >&2
+        fi
         sleep 1
         waited=$((waited + 1))
       done
       if [[ ! -d "$vol" ]]; then
         echo "[chatgpt2codex] warning: volume $vol did not mount within ${timeout}s" >&2
+      elif (( waited > 0 )); then
+        echo "[chatgpt2codex] volume $vol mounted after ${waited}s"
       fi
       ;;
   esac
@@ -294,7 +302,7 @@ run_macos_doctor
 need_cmd node
 need_cmd curl
 
-wait_for_volume_mount "$WORKSPACE" 30
+wait_for_volume_mount "$WORKSPACE" "${CHATGPT2CODEX_VOLUME_WAIT_SECONDS:-0}"
 mkdir -p "$WORKSPACE"
 WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 
