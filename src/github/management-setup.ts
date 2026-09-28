@@ -458,6 +458,16 @@ function agentsSnippet(input: ScaffoldInput): string {
 `;
 }
 
+/**
+ * macOS volumes are usually case-insensitive, so a plain stat of
+ * `pull_request_template.md` also hits `PULL_REQUEST_TEMPLATE.md`; match the
+ * directory entry's real name so the skip reason names the file that exists.
+ */
+async function existsWithExactName(root: string, relative: string): Promise<boolean> {
+  const entries = await fs.readdir(path.join(root, path.dirname(relative))).catch(() => [] as string[]);
+  return entries.includes(path.basename(relative));
+}
+
 /** Write each management file only where nothing equivalent exists. */
 export async function scaffoldManagementFiles(root: string, input: ScaffoldInput): Promise<ScaffoldResult> {
   const created: string[] = [];
@@ -492,7 +502,7 @@ export async function scaffoldManagementFiles(root: string, input: ScaffoldInput
     const equivalents = item.equivalents ?? [item.path];
     let existing: string | undefined;
     for (const candidate of equivalents) {
-      if (await exists(path.join(root, candidate))) {
+      if (await existsWithExactName(root, candidate)) {
         existing = candidate;
         break;
       }
