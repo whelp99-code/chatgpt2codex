@@ -122,6 +122,53 @@ function slugify(name: string): string {
 }
 
 /**
+ * Build a registry entry for `dir` (branch/dirty/package hints, id slug from
+ * `name`), the same way for every caller: the workspace-root scan below, and
+ * `scanWorkspaces`'s extra explicitly-registered roots. When `requireMarker`
+ * is true (the default, used for a root's direct children) a directory with
+ * no git repo and no project marker file yields no entry; an extra root
+ * registered via `workspace_register_project` passes `requireMarker: false`
+ * since it is a project by the owner's own say-so, marker or not.
+ */
+async function buildProjectEntry(
+  dir: string,
+  name: string,
+  requireMarker = true,
+): Promise<ProjectRegistryEntry | undefined> {
+  const isGit = await isGitRepo(dir);
+  if (requireMarker) {
+    const hasMarker = isGit || (await hasAnyProjectMarker(dir));
+    if (!hasMarker) return undefined;
+  }
+
+  const [branch, dirty, packageHints, hasAgentsMd, hasCodeBrain] = await Promise.all([
+    isGit ? getBranch(dir) : Promise.resolve(undefined),
+    isGit ? getDirty(dir) : Promise.resolve(undefined),
+    detectPackageHints(dir),
+    pathExists(path.join(dir, "AGENTS.md")).then(
+      async (has) => has || (await pathExists(path.join(dir, "CLAUDE.md"))),
+    ),
+    pathExists(path.join(dir, ".ai", "bin", "ai")),
+  ]);
+
+  const projectId = slugify(name);
+  const aliases = Array.from(new Set([name, projectId, name.toLowerCase()].map((a) => a)));
+
+  return {
+    projectId,
+    name,
+    root: dir,
+    aliases,
+    branch,
+    dirty,
+    hasAgentsMd,
+    hasCodeBrain,
+    packageHints,
+    lastSeenAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Scan the workspace root for candidate projects (git repos / project marker
  * folders) and build registry entries (PRD §8.1 workspace_list_projects,
  * §10 registry shape).
@@ -139,48 +186,17 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
   }
 
   const entries: ProjectRegistryEntry[] = [];
-  const nowIso = new Date().toISOString();
 
-  const pushProject = async (dir: string, name: string): Promise<void> => {
-    const isGit = await isGitRepo(dir);
-    const hasMarker = isGit || (await hasAnyProjectMarker(dir));
-    if (!hasMarker) return;
-
-    const [branch, dirty, packageHints, hasAgentsMd, hasCodeBrain] = await Promise.all([
-      isGit ? getBranch(dir) : Promise.resolve(undefined),
-      isGit ? getDirty(dir) : Promise.resolve(undefined),
-      detectPackageHints(dir),
-      pathExists(path.join(dir, "AGENTS.md")).then(
-        async (has) => has || (await pathExists(path.join(dir, "CLAUDE.md"))),
-      ),
-      pathExists(path.join(dir, ".ai", "bin", "ai")),
-    ]);
-
-    const projectId = slugify(name);
-    const aliases = Array.from(new Set([name, projectId, name.toLowerCase()].map((a) => a)));
-
-    entries.push({
-      projectId,
-      name,
-      root: dir,
-      aliases,
-      branch,
-      dirty,
-      hasAgentsMd,
-      hasCodeBrain,
-      packageHints,
-      lastSeenAt: nowIso,
-    });
-  };
-
-  await pushProject(root, path.basename(root));
+  const rootEntry = await buildProjectEntry(root, path.basename(root));
+  if (rootEntry) entries.push(rootEntry);
 
   for (const dirent of dirents) {
     if (!dirent.isDirectory()) continue;
     if (dirent.name.startsWith(".")) continue; // skip hidden/system dirs
 
     const dir = path.join(root, dirent.name);
-    await pushProject(dir, dirent.name);
+    const entry = await buildProjectEntry(dir, dirent.name);
+    if (entry) entries.push(entry);
   }
 
   return entries;
@@ -205,15 +221,54 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
  *
  * Returns the merged entries plus whichever roots could not be read, so the
  * caller can surface that without failing startup.
+ *
+ * `extraRoots` are additional folders registered explicitly via
+ * `workspace_register_project`: each one that still exists, is a directory,
+ * and resolves (via realpath) inside one of `roots` is registered as a
+ * project even without a marker file — its contents are never touched, only
+ * read to derive branch/dirty/package hints. A missing or now-outside extra
+ * root is skipped silently rather than added to `failedRoots`, since it is
+ * not a workspace root the caller asked to scan, just a folder that may no
+ * longer qualify. Passing no `extraRoots` leaves behaviour byte-for-byte
+ * unchanged.
  */
 export async function scanWorkspaces(
   roots: string[],
+  extraRoots: string[] = [],
 ): Promise<{ entries: ProjectRegistryEntry[]; failedRoots: Array<{ root: string; reason: string }> }> {
   const entries: ProjectRegistryEntry[] = [];
   const failedRoots: Array<{ root: string; reason: string }> = [];
   const seenRootPaths = new Set<string>();
   const usedIds = new Set<string>();
   const seenScanRoots = new Set<string>();
+  const resolvedScanRoots: string[] = [];
+
+  /** De-duplicate by resolved path, assign a collision-free id, tag with the
+   * enclosing workspace root, and push. Shared by both the normal scan and
+   * the extra explicitly-registered roots below. */
+  const register = (entry: ProjectRegistryEntry, workspaceRoot: string): void => {
+    const resolvedRoot = path.resolve(entry.root);
+    if (seenRootPaths.has(resolvedRoot)) return;
+    seenRootPaths.add(resolvedRoot);
+
+    let projectId = entry.projectId;
+    if (usedIds.has(projectId)) {
+      const parent = slugify(path.basename(path.dirname(resolvedRoot)));
+      const qualified = parent.length > 0 ? `${parent}-${projectId}` : projectId;
+      projectId = qualified;
+      let suffix = 2;
+      while (usedIds.has(projectId)) {
+        projectId = `${qualified}-${suffix}`;
+        suffix += 1;
+      }
+    }
+    usedIds.add(projectId);
+
+    // Keep the original id reachable as an alias so a name that used to
+    // resolve still does, as long as it stays unambiguous.
+    const aliases = Array.from(new Set([...entry.aliases, entry.projectId]));
+    entries.push({ ...entry, projectId, aliases, workspaceRoot });
+  };
 
   for (const rawRoot of roots) {
     const root = path.resolve(rawRoot);
@@ -227,29 +282,46 @@ export async function scanWorkspaces(
       failedRoots.push({ root, reason: err instanceof Error ? err.message : String(err) });
       continue;
     }
+    resolvedScanRoots.push(root);
 
     for (const entry of scanned) {
-      const resolvedRoot = path.resolve(entry.root);
-      if (seenRootPaths.has(resolvedRoot)) continue;
-      seenRootPaths.add(resolvedRoot);
+      register(entry, root);
+    }
+  }
 
-      let projectId = entry.projectId;
-      if (usedIds.has(projectId)) {
-        const parent = slugify(path.basename(path.dirname(resolvedRoot)));
-        const qualified = parent.length > 0 ? `${parent}-${projectId}` : projectId;
-        projectId = qualified;
-        let suffix = 2;
-        while (usedIds.has(projectId)) {
-          projectId = `${qualified}-${suffix}`;
-          suffix += 1;
+  if (extraRoots.length > 0) {
+    // Resolve every scanned root's realpath once; an extra root only
+    // qualifies when it resolves inside one of these (matching how
+    // workspace_get_project and workspace_register_project check containment).
+    const realScanRoots = await Promise.all(
+      resolvedScanRoots.map(async (root) => {
+        try {
+          return await fs.realpath(root);
+        } catch {
+          return root;
         }
-      }
-      usedIds.add(projectId);
+      }),
+    );
 
-      // Keep the original id reachable as an alias so a name that used to
-      // resolve still does, as long as it stays unambiguous.
-      const aliases = Array.from(new Set([...entry.aliases, entry.projectId]));
-      entries.push({ ...entry, projectId, aliases, workspaceRoot: root });
+    for (const rawExtra of extraRoots) {
+      const resolvedExtra = path.resolve(rawExtra);
+
+      const stat = await fs.stat(resolvedExtra).catch(() => undefined);
+      if (!stat || !stat.isDirectory()) continue; // missing or not a directory: skip silently
+
+      const realExtra = await fs.realpath(resolvedExtra).catch(() => undefined);
+      if (!realExtra) continue;
+
+      const enclosingIndex = realScanRoots.findIndex((realRoot) => {
+        const rel = path.relative(realRoot, realExtra);
+        return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+      });
+      if (enclosingIndex === -1) continue; // outside every scanned root: skip silently
+
+      const entry = await buildProjectEntry(resolvedExtra, path.basename(resolvedExtra), false);
+      if (!entry) continue;
+
+      register(entry, resolvedScanRoots[enclosingIndex] as string);
     }
   }
 
@@ -300,6 +372,13 @@ export function findProject(
   if (q.projectId) {
     const found = entries.find((e) => e.projectId === q.projectId);
     if (found) return { ok: true, entry: found };
+    // Callers pass the folder name they see (`signed_platform`) as often as
+    // the slugged id (`signed-platform`); accept an exact alias match, but
+    // never a fuzzy one, since an id must not silently pick another project.
+    const norm = normalize(q.projectId);
+    const byAlias = entries.filter((e) => [e.name, ...e.aliases].some((c) => normalize(c) === norm));
+    if (byAlias.length === 1) return { ok: true, entry: byAlias[0] as ProjectRegistryEntry };
+    if (byAlias.length > 1) return { ok: false, reason: "ambiguous", candidates: byAlias };
     return { ok: false, reason: "not_found" };
   }
 

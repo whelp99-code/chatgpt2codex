@@ -155,7 +155,8 @@ async function buildToolContext(workspaceRoots: string[], persistRegistry = true
   const store = new Store(stateDir);
   const ledger = new Ledger(stateDir);
 
-  const { entries: registry, failedRoots } = await scanWorkspaces(roots);
+  const extraRoots = await store.loadRegisteredProjectPaths();
+  const { entries: registry, failedRoots } = await scanWorkspaces(roots, extraRoots);
   // One missing folder must not take the whole workspace down with it — say
   // which root failed and index the rest.
   for (const failure of failedRoots) {
@@ -174,6 +175,8 @@ async function buildToolContext(workspaceRoots: string[], persistRegistry = true
     store: {
       loadProjects: () => store.loadProjects(),
       saveProjects: (p) => store.saveProjects(p),
+      loadRegisteredProjectPaths: () => store.loadRegisteredProjectPaths(),
+      saveRegisteredProjectPaths: (paths) => store.saveRegisteredProjectPaths(paths),
       getSession: (sessionKey) => store.getSession(sessionKey),
       setSession: (s, sessionKey) => store.setSession(s, sessionKey),
       listSessions: () => store.listSessions(),
@@ -484,7 +487,8 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const store = new Store(stateDir);
   const ledger = new Ledger(stateDir);
 
-  const { entries: registry, failedRoots } = await scanWorkspaces(workspaceRoots);
+  const extraRoots = await store.loadRegisteredProjectPaths();
+  const { entries: registry, failedRoots } = await scanWorkspaces(workspaceRoots, extraRoots);
   for (const failure of failedRoots) {
     console.error(`chatgpt2codex init: skipping unreadable workspace root ${failure.root} (${failure.reason})`);
   }
@@ -806,7 +810,8 @@ async function cmdDoctor(): Promise<void> {
   // only way to tell whether workspaces.txt was picked up is to start the
   // server and read its log.
   const configuredRoots = resolveWorkspaceRoots({ flags: {}, repeated: {} });
-  const { entries: doctorRegistry, failedRoots } = await scanWorkspaces(configuredRoots);
+  const doctorExtraRoots = await new Store(stateDir).loadRegisteredProjectPaths();
+  const { entries: doctorRegistry, failedRoots } = await scanWorkspaces(configuredRoots, doctorExtraRoots);
 
   console.log(`node: ${nodeVersion}`);
   console.log(`ripgrep: ${rgVersion ?? "not found"}`);

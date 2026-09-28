@@ -122,4 +122,36 @@ describe("Store", () => {
     expect(Number.isInteger(raw.updatedAt)).toBe(true);
     expect(raw.updatedAt).toBeGreaterThan(1000);
   });
+
+  it("returns an empty registered-project path list before anything is saved", async () => {
+    const paths = await store.loadRegisteredProjectPaths();
+    expect(paths).toEqual([]);
+  });
+
+  it("round-trips registered project paths through save/load", async () => {
+    await store.saveRegisteredProjectPaths(["/workspace/1b/signed_platform", "/workspace/other/nested"]);
+    const loaded = await store.loadRegisteredProjectPaths();
+    expect(loaded).toEqual(["/workspace/1b/signed_platform", "/workspace/other/nested"]);
+  });
+
+  it("overwrites the previous registered-project snapshot on subsequent saves", async () => {
+    await store.saveRegisteredProjectPaths(["/a/b"]);
+    await store.saveRegisteredProjectPaths(["/c/d"]);
+    const loaded = await store.loadRegisteredProjectPaths();
+    expect(loaded).toEqual(["/c/d"]);
+  });
+
+  it("writes registered-projects.json with 0600 permissions", async () => {
+    if (process.platform === "win32") return;
+    await store.saveRegisteredProjectPaths(["/a/b"]);
+    const fileStat = await stat(join(dir, "registered-projects.json"));
+    expect(fileStat.mode & 0o777).toBe(0o600);
+  });
+
+  it("rejects a corrupt registered-projects.json instead of silently coercing it", async () => {
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "registered-projects.json"), JSON.stringify({ not: "valid" }), "utf8");
+    await expect(store.loadRegisteredProjectPaths()).rejects.toThrow();
+  });
 });

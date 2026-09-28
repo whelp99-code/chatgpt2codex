@@ -118,8 +118,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "workspace_refresh_index",
     operationId: "workspace_refresh_index",
     summary: "Refresh the local project index",
-    description: "Rescan the local workspace root and refresh chatgpt2codex's project registry.",
-    schema: "WorkspaceRefreshIndexInput",
+    description:
+      "Rescan each workspace root's direct children, plus any folder registered with workspace_register_project, to refresh chatgpt2codex's project registry.",
+    schema: "EmptyInput",
   },
   {
     path: "/actions/workspace-get-project",
@@ -783,14 +784,6 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             includeDirty: { type: "boolean" },
             includeRecent: { type: "boolean" },
             limit: { type: "integer", minimum: 1, maximum: 100 },
-          },
-        },
-        WorkspaceRefreshIndexInput: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            depth: { type: "integer", minimum: 1 },
-            includeHidden: { type: "boolean" },
           },
         },
         WorkspaceGetProjectInput: {
