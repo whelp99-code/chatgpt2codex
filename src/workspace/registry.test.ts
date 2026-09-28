@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ErrorCode } from "../types.js";
-import { findProject, scanWorkspace } from "./registry.js";
+import { findProject, scanWorkspace, scanWorkspaces } from "./registry.js";
 import type { ProjectRegistryEntry } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -121,6 +121,77 @@ describe("scanWorkspace", () => {
     await expect(scanWorkspace(path.join(root, "does-not-exist"))).rejects.toMatchObject({
       code: ErrorCode.WORKSPACE_NOT_READY,
     });
+  });
+});
+
+describe("scanWorkspaces extraRoots", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), "chatgpt2codex-ws-extra-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("registers a nested extra folder with no marker of its own", async () => {
+    // Mirrors the real incident: `1b` is a registered git project, and
+    // `1b/signed_platform` (only .md/.txt files, no marker) sits two levels
+    // below the workspace root, where scanWorkspace never looks.
+    const outer = path.join(root, "1b");
+    await mkdir(outer, { recursive: true });
+    await initGitRepo(outer);
+    const nested = path.join(outer, "signed_platform");
+    await mkdir(nested, { recursive: true });
+    await writeFile(path.join(nested, "notes.md"), "hello");
+
+    const withoutExtra = await scanWorkspace(root);
+    expect(withoutExtra.some((e) => e.root === nested)).toBe(false);
+
+    const { entries, failedRoots } = await scanWorkspaces([root], [nested]);
+
+    expect(failedRoots).toEqual([]);
+    const entry = entries.find((e) => e.root === nested);
+    expect(entry).toBeDefined();
+    expect(entry?.projectId).toBe("signed-platform");
+    expect(entry?.workspaceRoot).toBe(root);
+    // Contents were only read, never modified.
+    expect(await readFile(path.join(nested, "notes.md"), "utf8")).toBe("hello");
+  });
+
+  it("silently ignores an extra root that no longer exists", async () => {
+    const missing = path.join(root, "gone");
+
+    const { entries, failedRoots } = await scanWorkspaces([root], [missing]);
+
+    expect(failedRoots).toEqual([]);
+    expect(entries.some((e) => e.root === missing)).toBe(false);
+  });
+
+  it("silently ignores an extra root outside every scanned workspace root", async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), "chatgpt2codex-ws-outside-"));
+    try {
+      const { entries, failedRoots } = await scanWorkspaces([root], [outside]);
+      expect(failedRoots).toEqual([]);
+      expect(entries.some((e) => e.root === outside)).toBe(false);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("does not change default behaviour when no extra roots are passed", async () => {
+    await writeFile(path.join(root, "package.json"), "{}");
+
+    const strip = (r: Awaited<ReturnType<typeof scanWorkspaces>>) => ({
+      failedRoots: r.failedRoots,
+      entries: r.entries.map((e) => ({ ...e, lastSeenAt: undefined })),
+    });
+
+    const withDefault = await scanWorkspaces([root]);
+    const withEmpty = await scanWorkspaces([root], []);
+
+    expect(strip(withDefault)).toEqual(strip(withEmpty));
   });
 });
 

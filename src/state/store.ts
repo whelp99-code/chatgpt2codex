@@ -49,6 +49,21 @@ const ProjectsFileSchema = z.object({
 
 type ProjectsFile = z.infer<typeof ProjectsFileSchema>;
 
+/**
+ * Folders explicitly registered as their own project with
+ * `workspace_register_project`, kept independent of `projects.json` (the
+ * scanner's own output) so a rescan cannot silently drop one. Every
+ * `scanWorkspaces` call re-reads this list and folds it back in as extra
+ * roots (see workspace_refresh_index / project_create / cmdServeStdio).
+ */
+const RegisteredProjectsFileSchema = z.object({
+  version: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  paths: z.array(z.string()),
+});
+
+type RegisteredProjectsFile = z.infer<typeof RegisteredProjectsFileSchema>;
+
 /** `control` was missing from this list while LeasePreset (src/types.ts) has
  * carried it since desktop control landed, so persisting a control lease
  * failed schema validation on write. */
@@ -133,6 +148,7 @@ const FILE_MODE = 0o600;
 
 const PROJECTS_FILE = "projects.json";
 const SESSIONS_FILE = "sessions.json";
+const REGISTERED_PROJECTS_FILE = "registered-projects.json";
 
 function emptyProjectsFile(): ProjectsFile {
   return { version: 1, updatedAt: Date.now(), projects: [] };
@@ -240,6 +256,35 @@ export class Store {
       projects: validated,
     };
     await this.atomicWriteJson(PROJECTS_FILE, doc);
+  }
+
+  /**
+   * Absolute paths registered explicitly via `workspace_register_project`.
+   * Independent of `projects.json` so a plain rescan (which only ever
+   * derives entries from the workspace roots and this list) cannot lose the
+   * registration by omission.
+   */
+  async loadRegisteredProjectPaths(): Promise<string[]> {
+    const raw = await this.readJson(REGISTERED_PROJECTS_FILE);
+    if (raw === undefined) return [];
+    const parsed = RegisteredProjectsFileSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw new DomainError(
+        ErrorCode.NOT_IMPLEMENTED,
+        `Store: ${REGISTERED_PROJECTS_FILE} failed validation: ${parsed.error.message}`,
+      );
+    }
+    return parsed.data.paths;
+  }
+
+  async saveRegisteredProjectPaths(paths: string[]): Promise<void> {
+    const validated = z.array(z.string()).parse(paths);
+    const doc: RegisteredProjectsFile = {
+      version: 1,
+      updatedAt: Date.now(),
+      paths: validated,
+    };
+    await this.atomicWriteJson(REGISTERED_PROJECTS_FILE, doc);
   }
 
   /**

@@ -143,6 +143,12 @@ export interface ToolContext {
   store: {
     loadProjects(): Promise<ProjectRegistryEntry[]>;
     saveProjects(p: ProjectRegistryEntry[]): Promise<void>;
+    /** Absolute paths registered explicitly via `workspace_register_project`,
+     * independent of the scanned `projects.json` so a rescan cannot drop one
+     * by omission. Optional so hand-built test contexts need not implement
+     * it; callers that omit it simply register nothing extra. */
+    loadRegisteredProjectPaths?(): Promise<string[]>;
+    saveRegisteredProjectPaths?(paths: string[]): Promise<void>;
     getSession(sessionKey?: string): Promise<unknown>;
     setSession(s: unknown, sessionKey?: string): Promise<void>;
     /** Every persisted session, used to detect cross-session lease conflicts.

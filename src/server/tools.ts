@@ -83,6 +83,14 @@ function workspaceRootsOf(ctx: ToolContext): string[] {
   if (Array.isArray(roots) && roots.length > 0) return roots;
   return ctx.workspaceRoot ? [ctx.workspaceRoot] : [];
 }
+
+/** Folders registered explicitly via `workspace_register_project`, to pass
+ * into every `scanWorkspaces` call so a rescan keeps seeing them. Optional on
+ * the store interface — a hand-built test context without it simply
+ * registers nothing extra. */
+async function extraRootsOf(ctx: ToolContext): Promise<string[]> {
+  return (await ctx.store.loadRegisteredProjectPaths?.()) ?? [];
+}
 import {
   assertWritable,
   canTakeOverWriteLock,
@@ -249,7 +257,7 @@ async function resolveOrThrow(
   // Name both recoveries instead of leaving the caller to guess.
   throw new DomainError(
     ErrorCode.PROJECT_NOT_FOUND,
-    `Project not found: ${q.projectId ?? q.name}. If its folder already exists, call workspace_refresh_index; to create it, call project_create.`,
+    `Project not found: ${q.projectId ?? q.name}. If its folder already exists directly under a workspace root, call workspace_refresh_index; if it is nested deeper below a root, call workspace_register_project; to create it, call project_create.`,
   );
 }
 
@@ -967,7 +975,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "Report: include changed files, verification command/output, proof artifact, and remaining risk without claiming unstaged work is committed.",
             ],
             toolSurfaceMap: {
-              discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_create", "project_select"],
+              discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "workspace_register_project", "project_create", "project_select"],
               inspect: ["project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
               modify: ["file_apply_patch", "file_create"],
               verify: ["verification_profile", "verification_run", "command_list", "local_shell_run", "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"],
@@ -1576,9 +1584,42 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           }
           const found = entries.find((e) => path.resolve(e.root) === path.resolve(realPath));
           if (!found) {
-            throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, "No project registered at path", {
-              path: input.path,
-            });
+            // Registered roots are recorded as configured, not realpath'd, so
+            // compare against each entry's own realpath (falling back to its
+            // resolved path when that fails) rather than the raw string —
+            // otherwise a workspace root that is itself a symlink (e.g.
+            // macOS /var -> /private/var) would never match `realPath`.
+            const withRealRoot = await Promise.all(
+              entries.map(async (e) => ({
+                entry: e,
+                realRoot: await fs.realpath(e.root).catch(() => path.resolve(e.root)),
+              })),
+            );
+            // Most specific (longest) enclosing root wins, so a project
+            // registered inside another registered project is named rather
+            // than its outer ancestor.
+            const enclosing = withRealRoot
+              .filter(({ realRoot }) => {
+                const rel = path.relative(realRoot, realPath);
+                return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+              })
+              .sort((a, b) => b.realRoot.length - a.realRoot.length)[0]?.entry;
+
+            if (enclosing) {
+              throw new DomainError(
+                ErrorCode.PROJECT_NOT_FOUND,
+                `No project registered at path. It is inside project "${enclosing.projectId}" (${enclosing.root}): ` +
+                  `select that project and use paths relative to it, or call workspace_register_project to register ` +
+                  `this folder as its own project.`,
+                { path: input.path, enclosingProjectId: enclosing.projectId },
+              );
+            }
+
+            throw new DomainError(
+              ErrorCode.PROJECT_NOT_FOUND,
+              "No project registered at path. Call workspace_register_project to register this folder as its own project.",
+              { path: input.path },
+            );
           }
           return makeResult({ project: toProject(found) }, `Project: ${found.name}`);
         }
@@ -1597,21 +1638,128 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   );
 
   registerTool(
+    "workspace_register_project",
+    {
+      title: "Register a nested project folder",
+      description:
+        "Register an existing folder at any depth under a workspace root as its own project, without modifying its contents. Use this when a folder sits below a root's direct children (the scanner only descends one level) or carries no project marker, so workspace_get_project and project_select cannot see it otherwise.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Registering project folder...", "Project folder registered"),
+      inputSchema: {
+        path: z.string(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "workspace_register_project", input, async () => {
+        let realPath: string;
+        try {
+          realPath = await fs.realpath(input.path);
+        } catch {
+          throw new DomainError(ErrorCode.PATH_OUTSIDE_WORKSPACE, "path does not exist", {
+            path: input.path,
+          });
+        }
+
+        const stat = await fs.stat(realPath).catch(() => undefined);
+        if (!stat || !stat.isDirectory()) {
+          throw new DomainError(ErrorCode.PATH_OUTSIDE_WORKSPACE, "path is not a directory", {
+            path: input.path,
+          });
+        }
+
+        const roots = workspaceRootsOf(ctx);
+        const realRoots = await Promise.all(
+          roots.map(async (root) => ({ root, real: await fs.realpath(root).catch(() => root) })),
+        );
+
+        if (realRoots.some(({ real }) => real === realPath)) {
+          throw new DomainError(
+            ErrorCode.PATH_OUTSIDE_WORKSPACE,
+            "path is a workspace root itself, not a nested folder",
+            { path: input.path, workspaceRoots: roots },
+          );
+        }
+
+        const enclosing = realRoots.find(({ real }) => {
+          const rel = path.relative(real, realPath);
+          return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+        });
+        if (!enclosing) {
+          throw new DomainError(ErrorCode.PATH_OUTSIDE_WORKSPACE, "path is outside every workspace root", {
+            path: input.path,
+            workspaceRoots: roots,
+          });
+        }
+
+        const relFromRoot = path.relative(enclosing.real, realPath);
+        const hasHiddenSegment = relFromRoot.split(path.sep).some((segment) => segment.startsWith("."));
+        if (hasHiddenSegment) {
+          throw new DomainError(
+            ErrorCode.INVALID_PROJECT_NAME,
+            "path contains a '.'-prefixed segment, which the scanner always skips and could never be selected.",
+            { path: input.path },
+          );
+        }
+
+        // Already registered (resolved path match): return it unchanged,
+        // nothing to add or rescan.
+        const entries = await currentRegistry(ctx);
+        const already = entries.find((e) => path.resolve(e.root) === path.resolve(realPath));
+        if (already) {
+          return makeResult(
+            { project: toProject(already) },
+            `Already registered as project ${already.projectId}. Select it with project_select.`,
+          );
+        }
+
+        const existingExtras = await extraRootsOf(ctx);
+        const nextExtras = Array.from(new Set([...existingExtras, realPath]));
+        const { entries: scanned, failedRoots } = await scanWorkspaces(roots, nextExtras);
+        ctx.registry.splice(0, ctx.registry.length, ...scanned);
+        await ctx.store.saveProjects(scanned);
+        await ctx.store.saveRegisteredProjectPaths?.(nextExtras);
+
+        const entry = scanned.find((e) => path.resolve(e.root) === path.resolve(realPath));
+        if (!entry) {
+          throw new DomainError(
+            ErrorCode.WORKSPACE_NOT_READY,
+            `Registered ${realPath}, but it is not in the index. Unreadable roots: ${
+              failedRoots.map((f) => f.root).join(", ") || "none reported"
+            }`,
+            { path: realPath, failedRoots },
+          );
+        }
+
+        await ctx.ledger.append({
+          type: "project.registered",
+          projectId: entry.projectId,
+          root: entry.root,
+          workspaceRoot: enclosing.root,
+        });
+
+        return makeResult(
+          { project: toProject(entry) },
+          `Registered ${entry.root} as project ${entry.projectId}. Select it with project_select.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
     "workspace_refresh_index",
     {
       title: "Refresh workspace index",
-      description: "Rescan the workspace root to refresh the project registry.",
+      description:
+        "Rescan each workspace root's direct children, plus any folder registered with workspace_register_project, to refresh the project registry.",
       annotations: LOCAL_STATE_ANNOTATIONS,
       _meta: chatGptToolMeta("Refreshing workspace index...", "Workspace index refreshed"),
-      inputSchema: {
-        depth: z.number().int().optional(),
-        includeHidden: z.boolean().optional(),
-      },
+      inputSchema: {},
     },
     async (input) => {
       return withErrorMapping(ctx, "workspace_refresh_index", input, async () => {
         const roots = workspaceRootsOf(ctx);
-        const { entries: scanned, failedRoots } = await scanWorkspaces(roots);
+        const extraRoots = await extraRootsOf(ctx);
+        const { entries: scanned, failedRoots } = await scanWorkspaces(roots, extraRoots);
         ctx.registry.splice(0, ctx.registry.length, ...scanned);
         await ctx.store.saveProjects(scanned);
         const updatedAt = Date.now();
@@ -1666,7 +1814,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         await fs.mkdir(dir, { recursive: true });
         const marker = await ensureProjectMarker(dir);
 
-        const { entries: scanned, failedRoots } = await scanWorkspaces(roots);
+        const extraRoots = await extraRootsOf(ctx);
+        const { entries: scanned, failedRoots } = await scanWorkspaces(roots, extraRoots);
         ctx.registry.splice(0, ctx.registry.length, ...scanned);
         await ctx.store.saveProjects(scanned);
 
